@@ -1,5 +1,5 @@
 # POMP: Pathology-omics Multimodal Pre-training Framework for Cancer Survival Prediction
-![image](https://github.com/SuixueWang/POMP/POMP-framework.png)
+![image](https://github.com/SuixueWang/POMP/blob/master/POMP-framework.png)
 
 This is a PyTorch implementation of the POMP paper under Linux with GPU NVIDIA A100 80GB.
 
