@@ -1,0 +1,173 @@
+import math
+import sys
+import random
+from typing import Iterable, Optional
+import torch
+import torch.nn.functional as F
+from timm.data import Mixup
+import utils.misc as misc
+import utils.lr_sched as lr_sched
+from model.cox_loss import PartialLogLikelihood, calc_concordance_index, cox_log_rank
+from utils.options import logger
+
+def train_one_epoch(model: torch.nn.Module,
+                    data_loader: Iterable, optimizer: torch.optim.Optimizer,
+                    device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
+                    mixup_fn: Optional[Mixup] = None, log_writer=None,
+                    args=None):
+    model.train(True)
+    metric_logger = misc.MetricLogger(delimiter="  ")
+    metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+    header = 'Epoch: [{}]'.format(epoch)
+    print_freq = 1
+
+    accum_iter, batch_size = args.accum_iter, args.accum_iter
+
+    optimizer.zero_grad()
+
+    if log_writer is not None:
+        print('log_dir: {}'.format(log_writer.log_dir))
+
+    outputs_accum = None
+    censored_accum = None
+    survival_accum = None
+    k = -1
+    for data_iter_step, (regions, X_mrna, X_mirna, X_meth, censored, survival) in enumerate(data_loader):
+
+        # we use a per iteration (instead of per epoch) lr scheduler
+        if (data_iter_step+1) % accum_iter == 0:
+            lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
+
+        regions = regions.to(device, non_blocking=True)
+        X_mrna = X_mrna.to(device, non_blocking=True)
+        X_mirna = X_mirna.to(device, non_blocking=True)
+        X_meth = X_meth.to(device, non_blocking=True)
+        censored = censored.to(device, non_blocking=True)
+        survival = survival.to(device, non_blocking=True)
+
+        with torch.cuda.amp.autocast():
+            samples = [regions, X_mrna, X_mirna, X_meth]
+            outputs1, image_embed, omics_embed = model(samples)
+            outputs1 = outputs1.unsqueeze(1)
+            outputs2 = model.path_guided_omics_encoder(image_embed, omics_embed)
+            outputs = outputs1 + outputs2
+
+        k += 1
+        if k == 0:
+            outputs_accum = outputs
+            censored_accum = censored
+            survival_accum = survival
+        else:
+            outputs_accum = torch.cat((outputs_accum, outputs), 0)
+            censored_accum = torch.cat((censored_accum, censored), 0)
+            survival_accum = torch.cat((survival_accum, survival), 0)
+
+        if k == accum_iter - 1 or data_iter_step == len(data_loader) - 1: #
+            k = -1
+
+            outputs_accum = outputs_accum[torch.argsort(survival_accum, descending=True)]
+            censored_accum = censored_accum[torch.argsort(survival_accum, descending=True)]
+            survival_accum = survival_accum[torch.argsort(survival_accum, descending=True)]
+
+            try:
+                c_index = calc_concordance_index(outputs_accum, censored_accum, survival_accum)
+                loss = PartialLogLikelihood(outputs_accum, censored_accum, survival_accum)
+                p_value = cox_log_rank(outputs_accum.flatten(0), censored_accum, survival_accum)
+            except Exception as e:
+                print(e.args)
+                outputs_accum = None
+                censored_accum = None
+                survival_accum = None
+                continue
+
+            logger.info(f"---------- training c-index: {c_index:.4f}, p-value: {p_value:.10f} ------------------")
+            metric_logger.meters['c-index'].update(c_index, n=data_loader.batch_size)
+            metric_logger.meters['p-value'].update(p_value, n=data_loader.batch_size)
+
+            loss_value = loss.item()
+
+            if not math.isfinite(loss_value):
+                logger.info("Loss is {}, stopping training".format(loss_value))
+                sys.exit(1)
+
+            loss /= accum_iter
+
+            # if data_iter_step > 0 and (data_iter_step + 1) % accum_iter == 0:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
+            metric_logger.update(loss=loss_value)
+            min_lr = 10.
+            max_lr = 0.
+            for group in optimizer.param_groups:
+                min_lr = min(min_lr, group["lr"])
+                max_lr = max(max_lr, group["lr"])
+
+            metric_logger.update(lr=max_lr)
+
+            loss_value_reduce = misc.all_reduce_mean(loss_value)
+            if log_writer is not None and (data_iter_step + 1) % accum_iter == 0:
+                """ We use epoch_1000x as the x-axis in tensorboard.
+                This calibrates different curves when batch size changes.
+                """
+                epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
+                log_writer.add_scalar('loss', loss_value_reduce, epoch_1000x)
+                log_writer.add_scalar('lr', max_lr, epoch_1000x)
+
+        # gather the stats from all processes
+    metric_logger.synchronize_between_processes()
+    # logger.info(f"Averaged stats: {metric_logger}")
+    model.eval()
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}, model
+
+
+@torch.no_grad()
+def evaluate(data_loader, model, device):
+
+    metric_logger = misc.MetricLogger(delimiter="  ")
+    header = 'Test:'
+
+    # switch to evaluation mode
+    model.eval()
+    output_all, censored_all, survival_all = torch.tensor([], device=device), \
+                                             torch.tensor([], device=device), \
+                                             torch.tensor([], device=device)
+    # metric_logger.log_every(data_loader, 10, header)
+    for data_iter_step, (regions, X_mrna, X_mirna, X_meth, censored, survival) in enumerate(data_loader):
+
+        regions = regions.to(device, non_blocking=True)
+        X_mrna = X_mrna.to(device, non_blocking=True)
+        X_mirna = X_mirna.to(device, non_blocking=True)
+        X_meth = X_meth.to(device, non_blocking=True)
+        censored = censored.to(device, non_blocking=True)
+        survival = survival.to(device, non_blocking=True)
+
+        # compute output
+        with torch.cuda.amp.autocast():
+            samples = [regions, X_mrna, X_mirna, X_meth]
+            outputs1, image_embed, omics_embed = model(samples)
+            outputs2 = model.path_guided_omics_encoder(image_embed, omics_embed)
+            outputs = outputs1 + outputs2
+
+            output_all = torch.cat((output_all, outputs), 0)
+            censored_all = torch.cat((censored_all, censored), 0)
+            survival_all = torch.cat((survival_all, survival), 0)
+
+    c_index = calc_concordance_index(output_all, censored_all, survival_all)
+    p_value = cox_log_rank(output_all.flatten(0), censored_all, survival_all)
+
+    metric_logger.meters['c-index'].update(c_index.item(), n=data_loader.batch_size)
+    metric_logger.meters['p-value'].update(p_value.item(), n=data_loader.batch_size)
+    # print(f"-------- val --  c-index: {c_index:.4f}, p-value: {p_value:.8f} -----------")
+
+    # gather the stats from all processes
+    metric_logger.synchronize_between_processes()
+
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}, output_all, censored_all, survival_all
+
+

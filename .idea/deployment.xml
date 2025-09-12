@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="PublishConfigData" autoUpload="Always" serverName="wangsuixue@10.33.7.250:22" remoteFilesAllowedToDisappearOnAutoupload="false">
+    <serverData>
+      <paths name="wangsuixue@10.33.7.250:22">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/wangsuixue/source/python/POMP-new" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+    </serverData>
+    <option name="myAutoUpload" value="ALWAYS" />
+  </component>
+</project>
