@@ -1,7 +1,7 @@
 import pickle
 import os
 
-
+# datasets_multimodal_pretrain.pkl 파일을 decoding하여 필요한 LUAD 데이터의 ID(Patient ID, UUID) 확보하기 위함
 with open("/Users/choijiyubaik/Documents/DAC/26춘계_의정학/POMP/pre-training/datasets/datasets_multimodal_pretrain.pkl", "rb") as f:
 
     data = pickle.load(f)
