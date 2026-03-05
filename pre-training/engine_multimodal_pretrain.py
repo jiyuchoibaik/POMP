@@ -1,77 +1,72 @@
+# engine_multimodal_pretrain.py  ─ TCGA-LUAD (RNA-seq 단일 omics)
 import math
 import sys
 import random
 from typing import Iterable, Optional
+
 import torch
 import torch.nn.functional as F
-from timm.data import Mixup
+
 import utils.misc as misc
 import utils.lr_sched as lr_sched
 from utils.options import logger
 
+
 def train_one_epoch(model: torch.nn.Module,
-                    data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
-                    mixup_fn: Optional[Mixup] = None, log_writer=None,
+                    data_loader: Iterable,
+                    optimizer: torch.optim.Optimizer,
+                    device: torch.device,
+                    epoch: int,
+                    loss_scaler,
+                    max_norm: float = 0,
+                    log_writer=None,
                     args=None):
+
     model.train(True)
     metric_logger = misc.MetricLogger(delimiter="  ")
-    metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
-    header = 'Epoch: [{}]'.format(epoch)
+    metric_logger.add_meter("lr", misc.SmoothedValue(window_size=1, fmt="{value:.6f}"))
+    header     = f"Epoch: [{epoch}]"
     print_freq = 1
 
-    accum_iter, batch_size = args.accum_iter, args.accum_iter
+    accum_iter = args.accum_iter
+    batch_size = args.accum_iter
+    mask_ratio = getattr(args, "mask_ratio", 0.3)   # gene masking 비율
 
     optimizer.zero_grad()
+    if log_writer:
+        print(f"log_dir: {log_writer.log_dir}")
 
-    if log_writer is not None:
-        print('log_dir: {}'.format(log_writer.log_dir))
-
-    omics_feats = None
-    image_feats = None
-    omics_embeds = []
+    # accumulation buffer
+    omics_feats  = None
+    image_feats  = None
     image_embeds = []
-    omics_mask, idx_mask = [], []
+    omics_embeds = []
+    rna_masks    = []   # 마스킹된 원본 RNA 벡터 (MOM 학습용)
     k = -1
-    # for data_iter_step, (vec_patches, X_mrna, X_mirna, X_meth) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-    for data_iter_step, (regions, X_mrna, X_mirna, X_meth) in enumerate(data_loader):
 
-        # if data_iter_step > 0:
-        #     metric_logger.update(lr=0.0001)
-        #     break
+    for data_iter_step, (regions, x_rna) in enumerate(data_loader):
 
-        # we use a per iteration (instead of per epoch) lr scheduler
-        if (data_iter_step+1) % accum_iter == 0:
-            lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
+        if (data_iter_step + 1) % accum_iter == 0:
+            lr_sched.adjust_learning_rate(
+                optimizer, data_iter_step / len(data_loader) + epoch, args)
 
         regions = regions.to(device, non_blocking=True)
-        X_mrna = X_mrna.to(device, non_blocking=True)
-        X_mirna = X_mirna.to(device, non_blocking=True)
-        X_meth = X_meth.to(device, non_blocking=True)
+        x_rna   = x_rna.to(device, non_blocking=True)   # (1, rna_dim)
 
-        # random mask omics data
-        ri = random.randint(1, 3)
-        if ri == 1:
-            omics_mask.append(X_mrna[0])
-            idx_mask.append(1)
-            X_mrna = torch.ones([1, X_mrna.shape[1]], dtype=torch.float32)\
-                .to(device, non_blocking=True)
-        elif ri == 2:
-            omics_mask.append(X_mirna[0])
-            idx_mask.append(2)
-            X_mirna = torch.ones([1, X_mirna.shape[1]], dtype=torch.float32)\
-                .to(device, non_blocking=True)
-        elif ri == 3:
-            omics_mask.append(X_meth[0])
-            idx_mask.append(3)
-            X_meth = torch.ones([1, X_meth.shape[1]], dtype=torch.float32)\
-                .to(device, non_blocking=True)
-        else:
-            pass
+        # ── Gene-level Masking (MOM: Masked Omics Modeling) ──────────────
+        # 원본 RNA 저장 후 mask_ratio 비율로 0으로 마스킹
+        rna_orig   = x_rna.clone()
+        n_genes    = x_rna.shape[1]
+        n_mask     = int(n_genes * mask_ratio)
+        mask_idx   = torch.randperm(n_genes)[:n_mask]
+        x_rna_masked        = x_rna.clone()
+        x_rna_masked[:, mask_idx] = 0.0
 
-        #
+        rna_masks.append(rna_orig[0])   # 원본 (재구성 타깃)
+
+        # ── Forward ──────────────────────────────────────────────────────
         with torch.cuda.amp.autocast():
-            samples = [regions, X_mrna, X_mirna, X_meth]
+            samples = [regions, x_rna_masked]
             img_cls, omics_cls, image_embed, omics_embed = model(samples)
 
         k += 1
@@ -79,102 +74,91 @@ def train_one_epoch(model: torch.nn.Module,
             omics_feats = omics_cls
             image_feats = img_cls
         else:
-            omics_feats = torch.cat((omics_feats, omics_cls), 0)
-            image_feats = torch.cat((image_feats, img_cls), 0)
+            omics_feats = torch.cat([omics_feats, omics_cls], dim=0)
+            image_feats = torch.cat([image_feats, img_cls],   dim=0)
         image_embeds.append(image_embed)
         omics_embeds.append(omics_embed)
 
+        # ── Loss 계산 (accum_iter 마다) ───────────────────────────────────
         if k == accum_iter - 1:
             k = -1
 
-            # calculating contrastive loss by referring CLIP code
-            # normalized features
-            omics_features = omics_feats / omics_feats.norm(dim=1, keepdim=True)
-            image_features = image_feats / image_feats.norm(dim=1, keepdim=True)
+            # ── 1. POC: Pathology-Omics Contrastive Loss (CLIP 방식) ─────
+            omics_feat = F.normalize(omics_feats, dim=1)
+            image_feat = F.normalize(image_feats, dim=1)
 
-            # cosine similarity as logits
             logit_scale = model.logit_scale.exp()
-            sim_i2o = logit_scale * image_features @ omics_features.t()
-            sim_o2i = sim_i2o.t()
-            contrastive_labels = torch.arange(batch_size, device=device)
-            loss_poc = (F.cross_entropy(sim_i2o, contrastive_labels) + \
-                   F.cross_entropy(sim_o2i, contrastive_labels))/2
+            sim_i2o     = logit_scale * image_feat @ omics_feat.t()
+            sim_o2i     = sim_i2o.t()
+            labels_poc  = torch.arange(batch_size, device=device)
 
-            with torch.no_grad():
+            loss_poc = (F.cross_entropy(sim_i2o, labels_poc) +
+                        F.cross_entropy(sim_o2i, labels_poc)) / 2
 
-                weights_i2o = F.softmax(sim_i2o[:, :batch_size], dim=1)
-                weights_o2i = F.softmax(sim_o2i[:, :batch_size], dim=1)
-
-                weights_i2o.fill_diagonal_(0)
-                weights_o2i.fill_diagonal_(0)
-
-            # calculate the pathology-omics match loss
-            # for positive samples
+            # ── 2. MOM: Masked Omics Modeling Loss (MSE) ─────────────────
+            rna_mask_stack = torch.stack(rna_masks, dim=0)  # (B, rna_dim)
             logits_mask, logits_cls = [], []
+
             for b in range(batch_size):
-                logit_mask, logit_cls = model.path_guided_omics_encoder(image_embeds[b], omics_embeds[b], idx_mask[b])
+                logit_mask, logit_cls = model.path_guided_omics_encoder(
+                    image_embeds[b], omics_embeds[b])
                 logits_mask.append(logit_mask[0])
                 logits_cls.append(logit_cls[0])
 
-            # calculate the loss of masked omics modeling first
-            omics_mask = torch.stack(omics_mask, dim=0)
-            logits_mask = torch.stack(logits_mask, dim=0)
-            loss_mom = (logits_mask - omics_mask) ** 2
-            loss_mom = loss_mom.mean()
+            logits_mask_stack = torch.stack(logits_mask, dim=0)  # (B, rna_dim)
+            loss_mom = F.mse_loss(logits_mask_stack, rna_mask_stack)
+
+            # ── 3. POM: Pathology-Omics Matching Loss (ITM 방식) ─────────
+            with torch.no_grad():
+                weights_i2o = F.softmax(sim_i2o, dim=1).clone()
+                weights_o2i = F.softmax(sim_o2i, dim=1).clone()
+                weights_i2o.fill_diagonal_(0)
+                weights_o2i.fill_diagonal_(0)
 
             try:
-                # select a negative image for each omics
+                # negative omics for each image
                 for b in range(batch_size):
                     neg_idx = torch.multinomial(weights_o2i[b], 1).item()
-                    _, logit_cls = model.path_guided_omics_encoder(image_embeds[neg_idx], omics_embeds[b], idx_mask[b])
+                    _, logit_cls = model.path_guided_omics_encoder(
+                        image_embeds[neg_idx], omics_embeds[b])
                     logits_cls.append(logit_cls[0])
 
-                # select a negative omics for each image
+                # negative image for each omics
                 for b in range(batch_size):
                     neg_idx = torch.multinomial(weights_i2o[b], 1).item()
-                    _, logit_cls = model.path_guided_omics_encoder(image_embeds[b], omics_embeds[neg_idx], idx_mask[neg_idx])
+                    _, logit_cls = model.path_guided_omics_encoder(
+                        image_embeds[b], omics_embeds[neg_idx])
                     logits_cls.append(logit_cls[0])
 
             except Exception as e:
-                omics_embeds = []
-                image_embeds = []
-                omics_mask, idx_mask = [], []
-                logger.info(f"Exception: {e.args}")
+                image_embeds, omics_embeds, rna_masks = [], [], []
+                logger.info(f"POM negative sampling 오류: {e}")
                 continue
 
-            itm_labels = torch.cat([torch.ones(batch_size, dtype=torch.long), torch.zeros(2 * batch_size, dtype=torch.long)],
-                                   dim=0).to(device, non_blocking=True)
+            # positive: batch_size개, negative: 2*batch_size개
+            itm_labels = torch.cat([
+                torch.ones(batch_size,     dtype=torch.long),
+                torch.zeros(2*batch_size,  dtype=torch.long)
+            ], dim=0).to(device)
 
-            logits_cls = torch.stack(logits_cls, dim=0)
-            loss_pom = F.cross_entropy(logits_cls, itm_labels)
+            logits_cls_stack = torch.stack(logits_cls, dim=0)
+            loss_pom = F.cross_entropy(logits_cls_stack, itm_labels)
 
-            omics_embeds = []
-            image_embeds = []
-            omics_mask, idx_mask = [], []
+            # buffer reset
+            image_embeds, omics_embeds, rna_masks = [], [], []
 
-            ### total loss
+            # ── Total Loss ────────────────────────────────────────────────
             loss = loss_poc * 1.0 + loss_pom * 6.0 + loss_mom * 3.0
 
-            ### 6 combinations
-            # loss = loss_poc * 1.0 + loss_pom * 0.0 + loss_mom * 0.0
-            # loss = loss_poc * 0.0 + loss_pom * 6.0 + loss_mom * 0.0
-            # loss = loss_poc * 0.0 + loss_pom * 0.0 + loss_mom * 3.0
-
-            # loss = loss_poc * 0.0 + loss_pom * 6.0 + loss_mom * 3.0
-            # loss = loss_poc * 1.0 + loss_pom * 0.0 + loss_mom * 3.0
-            # loss = loss_poc * 1.0 + loss_pom * 6.0 + loss_mom * 0.0
-
-            metric_logger.update(loss_poc=loss_poc.item() * 1.0)
+            metric_logger.update(loss_poc=loss_poc.item())
             metric_logger.update(loss_pom=loss_pom.item() * 6.0)
             metric_logger.update(loss_mom=loss_mom.item() * 3.0)
 
             loss_value = loss.item()
-
             if not math.isfinite(loss_value):
-                logger.info("Loss is {}, stopping training".format(loss_value))
+                logger.info(f"Loss={loss_value}, 학습 중단")
                 sys.exit(1)
 
-            # loss /= accum_iter
             loss_scaler(loss, optimizer, parameters=model.parameters(),
                         update_grad=(data_iter_step + 1) % accum_iter == 0)
 
@@ -182,26 +166,20 @@ def train_one_epoch(model: torch.nn.Module,
                 optimizer.zero_grad()
 
             torch.cuda.synchronize()
-
             metric_logger.update(loss=loss_value)
-
-            logger.info(f"index:{data_iter_step+1}, loss: {loss}")
+            logger.info(f"[{data_iter_step+1}] loss={loss_value:.4f}  "
+                        f"poc={loss_poc.item():.4f}  "
+                        f"pom={loss_pom.item():.4f}  "
+                        f"mom={loss_mom.item():.4f}")
 
             lr = optimizer.param_groups[0]["lr"]
             metric_logger.update(lr=lr)
 
             loss_value_reduce = misc.all_reduce_mean(loss_value)
-            if log_writer is not None and (data_iter_step + 1) % accum_iter == 0:
-                """ We use epoch_1000x as the x-axis in tensorboard.
-                This calibrates different curves when batch size changes.
-                """
+            if log_writer and (data_iter_step + 1) % accum_iter == 0:
                 epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
-                log_writer.add_scalar('train_loss', loss_value_reduce, epoch_1000x)
-                log_writer.add_scalar('lr', lr, epoch_1000x)
+                log_writer.add_scalar("train_loss", loss_value_reduce, epoch_1000x)
+                log_writer.add_scalar("lr", lr, epoch_1000x)
 
-
-    # gather the stats from all processes
     metric_logger.synchronize_between_processes()
-    # logger.info(f"Averaged stats: {metric_logger}")
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}, model
-
+    return {k: m.global_avg for k, m in metric_logger.meters.items()}, model

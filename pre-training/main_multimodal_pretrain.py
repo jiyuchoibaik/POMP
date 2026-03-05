@@ -1,182 +1,180 @@
+# main_pretrain.py  ─ TCGA-LUAD (RNA-seq 단일 omics)
 import datetime
-import numpy as np
+import os
+import sys
+import json
 import time
-import pickle
 import random
 from pathlib import Path
+
+import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
 
-import timm
-# assert timm.__version__ == "0.3.2" # version check
-from timm.models.layers import trunc_normal_
-from timm.data.mixup import Mixup
-
-import sys, os, json
 sys.path.append(os.path.dirname(os.path.dirname(os.getcwd())))
 sys.path.append(os.path.dirname(os.getcwd()))
 
-import utils.lr_decay as lrd
 import utils.misc as misc
 from utils.misc import NativeScalerWithGradNormCount as NativeScaler
-from utils.data_loader import POMPDataset
-from model import models_pomp
+import utils.lr_decay as lrd
+
+from data_loader import build_dataset
+from models_pomp import vit_base_patch16
 from engine_multimodal_pretrain import train_one_epoch
-from utils.options import get_args_parser_pretrain, logger
+from utils.options import logger
 
-def set_seed(seed):
 
+def set_seed(seed: int):
     random.seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.benchmark     = False
     torch.backends.cudnn.deterministic = True
-    torch.cuda.manual_seed_all(seed)
+
+
+def get_args():
+    import argparse
+    ap = argparse.ArgumentParser("TCGA-LUAD Multimodal Pretraining")
+
+    # 데이터
+    ap.add_argument("--data_pkl",    default="./datasets/rna_processed.pkl",
+                    help="preprocess_rna.py 출력 pickle")
+    ap.add_argument("--n_genes",     default=2000, type=int,
+                    help="RNA-seq HVG 차원 (preprocess_rna.py와 동일하게)")
+    ap.add_argument("--max_patches", default=300,  type=int)
+
+    # 학습
+    ap.add_argument("--epochs",      default=501,  type=int)
+    ap.add_argument("--batch_size",  default=1,    type=int)
+    ap.add_argument("--accum_iter",  default=50,   type=int,
+                    help="gradient accumulation = effective batch size")
+    ap.add_argument("--mask_ratio",  default=0.3,  type=float,
+                    help="gene masking 비율 (MOM)")
+    ap.add_argument("--num_workers", default=8,    type=int)
+
+    # 옵티마이저
+    ap.add_argument("--lr",          default=5e-4, type=float)
+    ap.add_argument("--min_lr",      default=1e-6, type=float)
+    ap.add_argument("--warmup_epochs", default=50, type=int)
+    ap.add_argument("--weight_decay", default=1e-5, type=float)
+    ap.add_argument("--clip_grad",   default=None, type=float)
+    ap.add_argument("--layer_decay", default=0.75, type=float)
+
+    # 모델
+    ap.add_argument("--model",       default="vit_base_patch16", type=str)
+    ap.add_argument("--drop_path",   default=0.1,  type=float)
+    ap.add_argument("--global_pool", action="store_true", default=True)
+
+    # 저장
+    ap.add_argument("--output_dir",  default="./output_pretrain")
+    ap.add_argument("--log_dir",     default="./output_pretrain")
+    ap.add_argument("--exptype",     default="tcga_luad")
+    ap.add_argument("--save_every",  default=100,  type=int,
+                    help="N 에폭마다 체크포인트 저장")
+    ap.add_argument("--start_epoch", default=0,    type=int)
+    ap.add_argument("--resume",      default="",   type=str)
+
+    # 기타
+    ap.add_argument("--device",      default="cuda")
+    ap.add_argument("--seed",        default=200,  type=int)
+    ap.add_argument("--pin_mem",     action="store_true", default=True)
+    ap.add_argument("--dist_on_itp", action="store_true", default=False)
+    ap.add_argument("--distributed", action="store_true", default=False)
+    ap.add_argument("--world_size",  default=1,    type=int)
+    ap.add_argument("--local_rank",  default=-1,   type=int)
+    ap.add_argument("--dist_url",    default="env://")
+
+    return ap.parse_args()
 
 
 def main(args):
     misc.init_distributed_mode(args)
-
-    print('job dir: {}'.format(os.path.dirname(os.path.realpath(__file__))))
-    print("{}".format(args).replace(', ', ',\n'))
-
     device = torch.device(args.device)
 
-    start_time = time.time()
+    set_seed(args.seed)
+    logger.info(f"seed: {args.seed}")
 
-    # fix the seed for reproducibility
-    set_seed(seed=args.seed)
-    logger.info(f"set random seed: {args.seed}")
-
-    data = pickle.load(open(args.data_dir, 'rb'))
-    dataset_train = POMPDataset(
-        data=data,
+    # ── 데이터셋 ────────────────────────────────────────────────────────────
+    dataset = build_dataset(args.data_pkl, max_num_region=args.max_patches)
+    data_loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size  = args.batch_size,
+        num_workers = args.num_workers,
+        pin_memory  = args.pin_mem,
+        shuffle     = True,
+        drop_last   = False,
     )
 
-    print(dataset_train)
+    # ── TensorBoard ─────────────────────────────────────────────────────────
+    os.makedirs(args.log_dir, exist_ok=True)
+    log_writer = SummaryWriter(log_dir=args.log_dir) \
+        if misc.get_rank() == 0 else None
 
-    global_rank = misc.get_rank()
-    if global_rank == 0 and args.log_dir is not None and not args.eval:
-        os.makedirs(args.log_dir, exist_ok=True)
-        log_writer = SummaryWriter(log_dir=args.log_dir)
-    else:
-        log_writer = None
-
-    data_loader_train = torch.utils.data.DataLoader(
-        dataset_train,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        pin_memory=args.pin_mem,
-        drop_last=False,
-        shuffle=True
+    # ── 모델 ────────────────────────────────────────────────────────────────
+    model = vit_base_patch16(
+        rna_dim      = args.n_genes,
+        drop_path_rate = args.drop_path,
+        global_pool  = args.global_pool,
+        num_classes  = 0,   # head 미사용
     )
-
-    mixup_fn = None
-    mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
-    if mixup_active:
-        print("Mixup is activated!")
-        mixup_fn = Mixup(
-            mixup_alpha=args.mixup, cutmix_alpha=args.cutmix, cutmix_minmax=args.cutmix_minmax,
-            prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
-            label_smoothing=args.smoothing, num_classes=args.nb_classes)
-
-    model = models_pomp.__dict__[args.model](
-        num_classes=args.nb_classes,
-        drop_path_rate=args.drop_path,
-        global_pool=args.global_pool,
-    )
-
-    args.finetune = None
-    if args.finetune:
-        checkpoint = torch.load(args.finetune, map_location='cpu')
-
-        logger.info("Load pre-trained checkpoint from: {}".format(args.finetune))
-        checkpoint_model = checkpoint['model']
-        state_dict = model.state_dict()
-        for k in ['head.weight', 'head.bias']:
-            if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
-                print(f"Removing key {k} from pretrained checkpoint")
-                del checkpoint_model[k]
-
-        # load pre-trained model
-        model.load_state_dict(checkpoint_model, strict=False)
-
-        # manually initialize fc layer
-        trunc_normal_(model.head.weight, std=2e-5)
-
     model.to(device)
 
-    model_without_ddp = model
-    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"파라미터 수: {n_params/1e6:.2f}M")
 
-    # print("Model = %s" % str(model_without_ddp))
-    logger.info('number of params (M): %.2f' % (n_parameters / 1.e6))
-
-    eff_batch_size = args.batch_size * args.accum_iter * misc.get_world_size()
-
-    if args.lr is None:  # only base_lr is specified
-        args.lr = args.blr
-
-    logger.info("base lr: %.2e" % (args.lr))
-    logger.info("actual lr: %.2e" % args.lr)
-    logger.info("accumulate grad iterations: %d" % args.accum_iter)
-    logger.info("effective batch size: %d" % eff_batch_size)
-
-    # build optimizer with layer-wise lr decay (lrd)
-    param_groups = lrd.param_groups_lrd(model_without_ddp, args.weight_decay,
-        no_weight_decay_list=model_without_ddp.no_weight_decay(),
-        layer_decay=args.layer_decay
+    # ── 옵티마이저 ───────────────────────────────────────────────────────────
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.lr,
+        betas=(0.9, 0.999), weight_decay=args.weight_decay
     )
-    # optimizer = torch.optim.AdamW(param_groups, lr=args.lr)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=0.00001)
     loss_scaler = NativeScaler()
 
-    misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
+    misc.load_model(args=args, model_without_ddp=model,
+                    optimizer=optimizer, loss_scaler=loss_scaler)
 
-    logger.info(f"Start training for {args.epochs} epochs")
+    # ── 학습 루프 ────────────────────────────────────────────────────────────
+    logger.info(f"학습 시작: {args.epochs} epochs")
+    start = time.time()
+
     for epoch in range(args.start_epoch, args.epochs):
-
-        # train_one_epoch
         train_stats, model = train_one_epoch(
-            model,
-            data_loader_train,
-            optimizer,
-            device,
-            epoch,
-            loss_scaler,
-            args.clip_grad, mixup_fn,
-            log_writer=log_writer,
-            args=args
+            model, data_loader, optimizer,
+            device, epoch, loss_scaler,
+            max_norm   = args.clip_grad,
+            log_writer = log_writer,
+            args       = args,
         )
-        if args.output_dir and epoch >= 50 and epoch % 600 == 0:
+
+        # 체크포인트 저장
+        if args.output_dir and epoch >= 50 and epoch % args.save_every == 0:
             misc.save_model(
-                args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                loss_scaler=loss_scaler, epoch=epoch)
+                args=args, epoch=epoch, model=model,
+                model_without_ddp=model, optimizer=optimizer,
+                loss_scaler=loss_scaler,
+            )
 
-        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                        'epoch': epoch,}
-
+        log_stats = {**{f"train_{k}": v for k, v in train_stats.items()},
+                     "epoch": epoch}
         logger.info(log_stats)
 
         if args.output_dir and misc.is_main_process():
-            if log_writer is not None:
+            if log_writer:
                 log_writer.flush()
-            with open(os.path.join(args.output_dir, f"log_pretrain_{args.exptype}_04_14.txt"), mode="a", encoding="utf-8") as f:
+            log_path = os.path.join(
+                args.output_dir,
+                f"log_pretrain_{args.exptype}.txt"
+            )
+            with open(log_path, "a") as f:
                 f.write(json.dumps(log_stats) + "\n")
 
-    total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_time_str))
+    elapsed = str(datetime.timedelta(seconds=int(time.time() - start)))
+    logger.info(f"학습 완료. 소요시간: {elapsed}")
 
 
-if __name__ == '__main__':
-    args = get_args_parser_pretrain()
-    args = args.parse_args()
-
-    if args.output_dir:
-        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+if __name__ == "__main__":
+    args = get_args()
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)

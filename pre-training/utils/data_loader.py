@@ -1,90 +1,50 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-# --------------------------------------------------------
-# References:
-# DeiT: https://github.com/facebookresearch/deit
-# --------------------------------------------------------
-
-import PIL
-import numpy as np
+# data_loader.py  ─ TCGA-LUAD (RNA-seq + WSI)
 import pickle
-import os
-from torchvision import datasets, transforms
+import numpy as np
 import torch
 from torch.utils.data import Dataset
-from PIL import Image
-from matplotlib import pyplot as plt
 
 
-
-PIL.Image.MAX_IMAGE_PIXELS = 933120000
-
-def pil_loader(path: str) -> Image.Image:
-    # open path as file to avoid ResourceWarning (https://github.com/python-pillow/Pillow/issues/835)
-    with open(path, 'rb') as f:
-        img = Image.open(f)
-        return img.convert('RGB')
-
-
-# TODO: specify the return type
-def accimage_loader(path: str):
-    import accimage
-    try:
-        return accimage.Image(path)
-    except IOError:
-        # Potentially a decoding problem, fall back to PIL.Image
-        return pil_loader(path)
-
-# use PIL Image to read image
-def default_loader(path: str):
-    from torchvision import get_image_backend
-    if get_image_backend() == 'accimage':
-        return accimage_loader(path)
-    else:
-        return pil_loader(path)
-
-
-class POMPDataset(Dataset):
-
-    def __init__(self, data, loader = default_loader):
-
-        self.X_mrna = data['x_mrna']
-        self.X_mirna = data['x_mirna']
-        self.X_meth = data['x_meth']
-        self.region_pixel_5x = data['region_pixel_5x']
-
-        self.max_num_region = 300
-
-
-    def __getitem__(self, index):
-
-        single_X_mrna = torch.tensor(self.X_mrna[index]).type(torch.FloatTensor)
-        single_X_mirna = torch.tensor(self.X_mirna[index]).type(torch.FloatTensor)
-        single_X_meth = torch.tensor(self.X_meth[index]).type(torch.FloatTensor)
-
-        dir_patches = self.region_pixel_5x[index]
-        regions = np.load(dir_patches)
-
-        if regions.shape[0] > self.max_num_region:
-            regions = regions[:self.max_num_region, :, :, :]
-
-        return regions, single_X_mrna, single_X_mirna, single_X_meth
+class TCGALUADDataset(Dataset):
+    """
+    데이터 구조 (preprocess_rna.py + extract_patches.py 출력):
+      data = {
+        "case_ids":   [str, ...],          # 환자 ID 목록
+        "x_rna":      [[float,...], ...],  # (N, n_genes) log1p 정규화된 RNA-seq
+        "wsi_paths":  [str, ...],          # regions.npy 경로 목록
+        "n_genes":    int,
+      }
+    """
+    def __init__(self, data: dict, max_num_region: int = 300):
+        self.case_ids       = data["case_ids"]
+        self.x_rna          = data["x_rna"]          # list of lists
+        self.wsi_paths      = data["wsi_paths"]       # list of npy paths
+        self.max_num_region = max_num_region
 
     def __len__(self):
-        return len(self.X_mrna)
+        return len(self.case_ids)
+
+    def __getitem__(self, index):
+        # ── RNA-seq ──────────────────────────────────────────────────────────
+        x_rna = torch.tensor(self.x_rna[index], dtype=torch.float32)
+
+        # ── WSI 패치 ─────────────────────────────────────────────────────────
+        npy_path = self.wsi_paths[index]
+        regions  = np.load(npy_path)                  # (N, 3, 256, 256)
+
+        if regions.shape[0] > self.max_num_region:
+            # 랜덤 샘플링 (원본은 앞에서 자름 → 다양성을 위해 랜덤)
+            idx     = np.random.choice(regions.shape[0],
+                                       self.max_num_region, replace=False)
+            regions = regions[idx]
+
+        regions = torch.tensor(regions, dtype=torch.float32)
+
+        return regions, x_rna   # (N, 3, 256, 256),  (n_genes,)
 
 
-
-if __name__ == "__main__":
-
-    pass
-
-
-
-
-
-
-
+def build_dataset(pkl_path: str, max_num_region: int = 300) -> TCGALUADDataset:
+    with open(pkl_path, "rb") as f:
+        data = pickle.load(f)
+    print(f"[Dataset] {len(data['case_ids'])}개 케이스, RNA 차원={data['n_genes']}")
+    return TCGALUADDataset(data, max_num_region)
