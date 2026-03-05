@@ -13,7 +13,7 @@ from torch.utils.tensorboard import SummaryWriter
 from timm.models.layers import trunc_normal_
 from timm.data.mixup import Mixup
 
-import sys, os
+import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.getcwd())))
 sys.path.append(os.path.dirname(os.getcwd()))
 
@@ -25,273 +25,263 @@ from model import models_pomp
 from engine_multimodal_survival import train_one_epoch, evaluate
 from utils.options import get_args_parser_finetune, logger
 
-def set_seed(seed):
 
+def set_seed(seed):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.benchmark     = False
     torch.backends.cudnn.deterministic = True
-    torch.cuda.manual_seed_all(seed)
 
 
 def main(args):
     misc.init_distributed_mode(args)
-
-    print('job dir: {}'.format(os.path.dirname(os.path.realpath(__file__))))
-    print("{}".format(args).replace(', ', ',\n'))
-
     device = torch.device(args.device)
 
     data_cv_splits = pickle.load(open(args.data_dir, 'rb'))
-    start_time = time.time()
+
+    start_time   = time.time()
     best_predict = []
+
     for _k, data in data_cv_splits.items():
 
-        logger.info("**************************************************************")
-        logger.info("************** 5-folds Cross-validation (%d/%d) ***************" % (_k+1, len(data_cv_splits.items())))
-        logger.info("**************************************************************")
+        logger.info("=" * 60)
+        logger.info(f"5-fold Cross-validation ({_k+1}/{len(data_cv_splits)})")
+        logger.info("=" * 60)
 
-        # fix the seed for reproducibility
-        set_seed(seed=args.seed)
-        logger.info(f"set random seed: {args.seed}")
+        set_seed(args.seed)
 
-        dataset_train = POMPDataset(
-            data=data,
-            split="train",
-        )
+        dataset_train = POMPDataset(data=data, split="train")
+        dataset_val   = POMPDataset(data=data, split="validation")
+        dataset_test  = POMPDataset(data=data, split="test")
 
-        dataset_val = POMPDataset(
-            data=data,
-            split="validation",
-        )
-
-        dataset_test = POMPDataset(
-            data=data,
-            split="test",
-        )
-        print(dataset_train)
-
-        global_rank = misc.get_rank()
-        if global_rank == 0 and args.log_dir is not None and not args.eval:
+        if misc.get_rank() == 0 and args.log_dir and not args.eval:
             os.makedirs(args.log_dir, exist_ok=True)
             log_writer = SummaryWriter(log_dir=args.log_dir)
         else:
             log_writer = None
 
         data_loader_train = torch.utils.data.DataLoader(
-            dataset_train, #sampler=sampler_train,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            pin_memory=args.pin_mem,
-            drop_last=False,
-            shuffle=True
-        )
+            dataset_train, batch_size=args.batch_size,
+            num_workers=args.num_workers, pin_memory=args.pin_mem,
+            drop_last=False, shuffle=True)
 
         data_loader_val = torch.utils.data.DataLoader(
-            dataset_val, #sampler=sampler_val,
-            batch_size=1,
-            num_workers=args.num_workers,
-            pin_memory=args.pin_mem,
-            drop_last=False,
-            shuffle=False
-        )
+            dataset_val, batch_size=1,
+            num_workers=args.num_workers, pin_memory=args.pin_mem,
+            drop_last=False, shuffle=False)
 
         data_loader_test = torch.utils.data.DataLoader(
-            dataset_test, #sampler=sampler_test,
-            batch_size=1,
-            num_workers=args.num_workers,
-            pin_memory=args.pin_mem,
-            drop_last=False,
-            shuffle=False
-        )
+            dataset_test, batch_size=1,
+            num_workers=args.num_workers, pin_memory=args.pin_mem,
+            drop_last=False, shuffle=False)
 
-        mixup_fn = None
-        mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
-        if mixup_active:
-            print("Mixup is activated!")
-            mixup_fn = Mixup(
-                mixup_alpha=args.mixup, cutmix_alpha=args.cutmix, cutmix_minmax=args.cutmix_minmax,
-                prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
-                label_smoothing=args.smoothing, num_classes=args.nb_classes)
-
+        # ── 모델 생성 ────────────────────────────────────────────────────
+        # n_genes 인수 추가 (원본: 없음 → 수정: n_genes=args.n_genes)
         model = models_pomp.__dict__[args.model](
-            num_classes=args.nb_classes,
-            drop_path_rate=args.drop_path,
-            global_pool=args.global_pool,
+            num_classes   = args.nb_classes,
+            drop_path_rate= args.drop_path,
+            global_pool   = args.global_pool,
+            n_genes       = args.n_genes,       # ← 추가
         )
 
-        args.finetune = None
+        # ── Pre-trained 가중치 로드 ───────────────────────────────────────
         if args.finetune and not args.eval:
             checkpoint = torch.load(args.finetune, map_location='cpu')
+            logger.info(f"Pre-trained 체크포인트 로드: {args.finetune}")
 
-            logger.info("Load pre-trained checkpoint from: {}".format(args.finetune))
-            checkpoint_model = checkpoint['model']
+            ckpt_model = checkpoint.get('model', checkpoint)
             state_dict = model.state_dict()
-            for k in ['head.weight', 'head.bias']:
-                if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
-                    print(f"Removing key {k} from pretrained checkpoint")
-                    del checkpoint_model[k]
 
-            # load pre-trained model
-            model.load_state_dict(checkpoint_model, strict=False)
+            # 크기 불일치 키 제거 (linear: 300→n_genes 등)
+            skip_keys = []
+            for k in list(ckpt_model.keys()):
+                if k in state_dict and ckpt_model[k].shape != state_dict[k].shape:
+                    logger.info(f"  shape 불일치 스킵: {k} "
+                                f"{ckpt_model[k].shape} → {state_dict[k].shape}")
+                    skip_keys.append(k)
+                    del ckpt_model[k]
 
-            # manually initialize fc layer
-            trunc_normal_(model.head.weight, std=2e-5)
+            # pre-training에 없는 survival 전용 키 제거
+            for k in ['risk_head.0.weight', 'risk_head.0.bias']:
+                ckpt_model.pop(k, None)
+
+            msg = model.load_state_dict(ckpt_model, strict=False)
+            logger.info(f"  로드 결과: missing={msg.missing_keys[:5]}...")
+            trunc_normal_(model.risk_head[0].weight, std=2e-5)
 
         model.to(device)
+        n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logger.info(f"파라미터 수: {n_params/1e6:.2f}M")
 
-        model_without_ddp = model
-        n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-        # print("Model = %s" % str(model_without_ddp))
-        logger.info('number of params (M): %.2f' % (n_parameters / 1.e6))
-
-        eff_batch_size = args.batch_size * args.accum_iter * misc.get_world_size()
-
-        if args.lr is None:  # only base_lr is specified
-            # args.lr = args.blr * eff_batch_size / 256
+        if args.lr is None:
             args.lr = args.blr
+        optimizer    = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+        loss_scaler  = NativeScaler()
+        misc.load_model(args=args, model_without_ddp=model,
+                        optimizer=optimizer, loss_scaler=loss_scaler)
 
-        logger.info("base lr: %.2e" % (args.blr))
-        logger.info("actual lr: %.2e" % args.lr)
-        logger.info("accumulate grad iterations: %d" % args.accum_iter)
+        # ── 학습 루프 ─────────────────────────────────────────────────────
+        max_c_index_val          = 0.0
+        best_predict_split       = []
+        list_for_early_stop      = []
+        list_for_reload_best     = []
+        best_model_path          = os.path.join(
+            args.output_dir, f"best_model_{args.exptype}_fold{_k}.pth")
 
-        # optimizer = torch.optim.AdamW(param_groups, lr=args.lr)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
-        loss_scaler = NativeScaler()
-
-        misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
-
-        if args.eval:
-            test_stats = evaluate(data_loader_val, model, device)
-            logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
-            exit(0)
-
-        logger.info(f"Start training for {args.epochs} epochs")
-        max_c_index_val = 0.0
-        best_predict_split = []
-        list_for_early_stop = []
-        list_for_reload_best_model = []
         for epoch in range(args.start_epoch, args.epochs):
             if len(list_for_early_stop) >= 5:
-                logger.info(f"Now is early stopping; step: {len(list_for_early_stop)}")
+                logger.info("Early stopping")
                 break
 
-            if len(list_for_reload_best_model) >= 15:
-                list_for_reload_best_model = []
-                logger.info("reload the best model")
-                model.load_state_dict(torch.load(f'./output_finetune_dir/ablation_loss/best_model_{args.exptype}.pth'))
+            if len(list_for_reload_best) >= 15:
+                list_for_reload_best = []
+                if os.path.exists(best_model_path):
+                    logger.info("best model 재로드")
+                    model.load_state_dict(torch.load(best_model_path))
 
-            # if epoch >= 20:
-            #     continue
-            # else:
-            #     logger.info(f"Epoch: {epoch}")
-
-            # train_one_epoch
             train_stats, model = train_one_epoch(
-                model,
-                data_loader_train,
-                optimizer,
-                device,
-                epoch,
-                loss_scaler,
-                args.clip_grad, mixup_fn,
-                log_writer=log_writer,
-                args=args
-            )
+                model, data_loader_train, optimizer,
+                device, epoch, loss_scaler,
+                args.clip_grad, None,
+                log_writer=log_writer, args=args)
 
-            test_stats, pred, censored, survival = evaluate(data_loader_test, model, device)
+            test_stats, pred, censored, survival = evaluate(
+                data_loader_test, model, device)
             val_stats = test_stats
 
-            logger.info(f"-------- validation c-index: {val_stats['c-index']:.4f}, p-value: {val_stats['p-value']:.8f} -----------")
-            logger.info(f"-------------- test c-index: {test_stats['c-index']:.4f}, p-value: {test_stats['p-value']:.8f} -----------")
+            logger.info(f"val  c-index: {val_stats['c-index']:.4f}")
+            logger.info(f"test c-index: {test_stats['c-index']:.4f}")
 
             list_for_early_stop.append(val_stats['c-index'])
-            list_for_reload_best_model.append(val_stats['c-index'])
+            list_for_reload_best.append(val_stats['c-index'])
+
             if val_stats['c-index'] > max_c_index_val:
-                max_c_index_val = val_stats['c-index']
+                max_c_index_val      = val_stats['c-index']
+                list_for_early_stop  = []
+                list_for_reload_best = []
 
-                list_for_early_stop = []
-                list_for_reload_best_model = []
+                best_predict_split = [
+                    round(train_stats['c-index'], 4),
+                    round(val_stats['c-index'],   4),
+                    round(test_stats['c-index'],  4),
+                    round(train_stats['p-value'], 10),
+                    round(val_stats['p-value'],   10),
+                    round(test_stats['p-value'],  10),
+                ]
+                logger.info(f"★ New best val c-index: {max_c_index_val:.4f}")
 
-                best_predict_split = [round(train_stats['c-index'], 4),
-                                      round(val_stats['c-index'], 4),
-                                      round(test_stats['c-index'], 4),
-                                      round(train_stats['p-value'], 10),
-                                      round(val_stats['p-value'], 10),
-                                      round(test_stats['p-value'], 10),]
-                logger.info("************** hit *************")
-                logger.info(f"--- val: max c-index: {max_c_index_val:.4f}, "
-                            f"val: current c-index: {val_stats['c-index']:.4f}, "
-                            f"test: c-index: {test_stats['c-index']:.4f}, "
-                            f"p-value: {test_stats['p-value']:.10f} ---")
-
-                # if args.output_dir:
-                #     misc.save_model(
-                #         args=args, model=model, model_without_ddp=model_without_ddp,
-                #         optimizer=optimizer,
-                #         loss_scaler=loss_scaler, epoch=epoch)
-
-                if not os.path.exists(os.path.join(args.output_dir, f"predict_result_{args.exptype}")):
-                    os.makedirs(os.path.join(args.output_dir, f"predict_result_{args.exptype}"))
-
-                result_dir = os.path.join(args.output_dir, f"predict_result_{args.exptype}", f"predict_kfold_{_k}.csv")
-                res = {
-                    "predict": pred.flatten(0).cpu().detach().numpy(),
+                # 결과 저장
+                result_dir = os.path.join(
+                    args.output_dir, f"predict_result_{args.exptype}")
+                os.makedirs(result_dir, exist_ok=True)
+                pd.DataFrame({
+                    "predict":  pred.flatten(0).cpu().detach().numpy(),
                     "censored": censored.cpu().detach().numpy(),
-                    "survival": survival.cpu().detach().numpy()
-                }
-                pd.DataFrame(res).to_csv(result_dir, index=False)
+                    "survival": survival.cpu().detach().numpy(),
+                }).to_csv(os.path.join(result_dir, f"predict_kfold_{_k}.csv"),
+                          index=False)
 
-                torch.save(model.state_dict(), f'./output_finetune_dir/ablation_loss/best_model_{args.exptype}.pth')
+                torch.save(model.state_dict(), best_model_path)
 
-            log_stats = {'epoch': epoch, 'kfold': _k,
-                         **{f'train_{k}': round(v, 8) for k, v in train_stats.items()},
-                         **{f'val_{k}': round(v, 8) for k, v in val_stats.items()},
-                         **{f'test_{k}': round(v, 8) for k, v in test_stats.items()},
-                         }
+            log_stats = {
+                'epoch': epoch, 'kfold': _k,
+                **{f'train_{k}': round(v, 8) for k, v in train_stats.items()},
+                **{f'val_{k}':   round(v, 8) for k, v in val_stats.items()},
+                **{f'test_{k}':  round(v, 8) for k, v in test_stats.items()},
+            }
             logger.info(log_stats)
 
-            if log_writer is not None:
-                log_writer.add_scalar('perf/val_cindex', round(val_stats['c-index'],4), epoch)
-                log_writer.add_scalar('perf/val_pvalue', round(val_stats['p-value'],4), epoch)
-                log_writer.add_scalar('perf/test_cindex', round(test_stats['c-index'],4), epoch)
-                log_writer.add_scalar('perf/test_pvalue', round(test_stats['p-value'],4), epoch)
+            if log_writer:
+                log_writer.add_scalar('perf/val_cindex',  val_stats['c-index'],  epoch)
+                log_writer.add_scalar('perf/test_cindex', test_stats['c-index'], epoch)
 
-            if args.output_dir and misc.is_main_process():
-                if log_writer is not None:
-                    log_writer.flush()
-
-            logger.info("")
+            if args.output_dir and misc.is_main_process() and log_writer:
+                log_writer.flush()
 
         best_predict.append(best_predict_split)
-        logger.info(f"best performance for kfold {_k}: {best_predict_split}")
-        logger.info("\n\n")
+        logger.info(f"fold {_k} best: {best_predict_split}\n")
 
-    logger.info(f"best performance for all splits: {best_predict}")
-    logger.info(f"train cindex: {np.array(best_predict)[:,0]}, mean: {np.mean(np.array(best_predict)[:,0])}")
-    logger.info(f"val   cindex: {np.array(best_predict)[:, 1]}, mean: {np.mean(np.array(best_predict)[:, 1])}, std: {np.std(np.array(best_predict)[:, 1])}")
-    logger.info(f"test  cindex: {np.array(best_predict)[:, 2]}, mean: {np.mean(np.array(best_predict)[:, 2])}, std: {np.std(np.array(best_predict)[:, 2])}")
+    # ── 최종 결과 요약 ────────────────────────────────────────────────────
+    bp = np.array(best_predict)
+    logger.info(f"train c-index: {bp[:,0]}, mean={bp[:,0].mean():.4f}")
+    logger.info(f"val   c-index: {bp[:,1]}, mean={bp[:,1].mean():.4f} ± {bp[:,1].std():.4f}")
+    logger.info(f"test  c-index: {bp[:,2]}, mean={bp[:,2].mean():.4f} ± {bp[:,2].std():.4f}")
 
-    total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_time_str))
+    total = str(datetime.timedelta(seconds=int(time.time() - start_time)))
+    logger.info(f"총 학습 시간: {total}")
 
+    # fold별 예측 결과 합치기
     df_all = pd.DataFrame()
+    result_dir = os.path.join(args.output_dir, f"predict_result_{args.exptype}")
     for i in range(5):
-        result_dir = os.path.join(args.output_dir, f"predict_result_{args.exptype}", f"predict_kfold_{i}.csv")
-        df = pd.read_csv(result_dir)
-        df_all = pd.concat([df_all, df], axis=0)
-    df_all.to_csv(os.path.join(args.output_dir, f"predict_result_{args.exptype}", f"predict_result.csv"), index=False)
+        path = os.path.join(result_dir, f"predict_kfold_{i}.csv")
+        if os.path.exists(path):
+            df_all = pd.concat([df_all, pd.read_csv(path)], axis=0)
+    df_all.to_csv(os.path.join(result_dir, "predict_result.csv"), index=False)
+
+
+def get_args():
+    import argparse
+    ap = argparse.ArgumentParser("TCGA-LUAD Survival Fine-tuning")
+
+    # 데이터
+    ap.add_argument("--data_dir",    required=True,
+                    help="luad_cv_splits.pkl 경로")
+    ap.add_argument("--n_genes",     default=2000, type=int,
+                    help="RNA-seq HVG 차원 (preprocess_rna.py와 동일하게)")
+
+    # 모델
+    ap.add_argument("--model",       default="vit_base_patch16")
+    ap.add_argument("--finetune",    default="",
+                    help="pre-training 체크포인트 경로 (없으면 scratch)")
+    ap.add_argument("--nb_classes",  default=1, type=int)
+    ap.add_argument("--drop_path",   default=0.1, type=float)
+    ap.add_argument("--global_pool", action="store_true", default=True)
+
+    # 학습
+    ap.add_argument("--epochs",      default=100,  type=int)
+    ap.add_argument("--batch_size",  default=1,    type=int)
+    ap.add_argument("--accum_iter",  default=32,   type=int)
+    ap.add_argument("--lr",          default=None, type=float)
+    ap.add_argument("--blr",         default=1e-4, type=float)
+    ap.add_argument("--weight_decay",default=0.01, type=float)
+    ap.add_argument("--clip_grad",   default=1.0,  type=float)
+    ap.add_argument("--warmup_epochs",default=5,   type=int)
+    ap.add_argument("--min_lr",      default=1e-6, type=float)
+    ap.add_argument("--layer_decay", default=0.75, type=float)
+
+    ap.add_argument("--mixup",            default=0., type=float)
+    ap.add_argument("--cutmix",           default=0., type=float)
+    ap.add_argument("--cutmix_minmax",    default=None, nargs='+', type=float)
+    ap.add_argument("--mixup_prob",       default=1.0, type=float)
+    ap.add_argument("--mixup_switch_prob",default=0.5, type=float)
+    ap.add_argument("--mixup_mode",       default='batch')
+    ap.add_argument("--smoothing",        default=0.1, type=float)
+
+    # 저장 / 기타
+    ap.add_argument("--output_dir",  default="./output_finetune")
+    ap.add_argument("--log_dir",     default="./output_finetune")
+    ap.add_argument("--exptype",     default="tcga_luad")
+    ap.add_argument("--device",      default="cuda")
+    ap.add_argument("--seed",        default=42, type=int)
+    ap.add_argument("--num_workers", default=8,  type=int)
+    ap.add_argument("--pin_mem",     action="store_true", default=True)
+    ap.add_argument("--eval",        action="store_true", default=False)
+    ap.add_argument("--start_epoch", default=0,  type=int)
+    ap.add_argument("--resume",      default="")
+    ap.add_argument("--dist_on_itp", action="store_true", default=False)
+    ap.add_argument("--distributed", action="store_true", default=False)
+    ap.add_argument("--world_size",  default=1,  type=int)
+    ap.add_argument("--local_rank",  default=-1, type=int)
+    ap.add_argument("--dist_url",    default="env://")
+
+    return ap.parse_args()
+
 
 if __name__ == '__main__':
-    args = get_args_parser_finetune()
-    args = args.parse_args()
-
-    if args.output_dir:
-        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    args = get_args()
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)
