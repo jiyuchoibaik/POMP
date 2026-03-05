@@ -6,7 +6,7 @@
 # --------------------------------------------------------
 # Position embedding utils
 # --------------------------------------------------------
-
+# pos_embed.py
 import numpy as np
 
 import torch

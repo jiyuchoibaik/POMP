@@ -122,7 +122,7 @@ def main(args):
         cid = row["case_id"]
         if cid in rna_vectors:
             wsi_paths[cid] = os.path.join(
-                args.wsi_dir, cid, row["wsi_file_name"]
+                args.wsi_dir, cid, "regions.npy"
             ) if args.wsi_dir else ""
 
     # 저장
@@ -149,7 +149,7 @@ if __name__ == "__main__":
     ap.add_argument("--rna_dir",  required=True, help="downloads/rnaseq 경로")
     ap.add_argument("--mapping",  required=True, help="downloads/mapping.csv 경로")
     ap.add_argument("--out",      default="./datasets/rna_processed.pkl")
-    ap.add_argument("--wsi_dir",  default="", help="downloads/wsi 경로 (옵션)")
+    ap.add_argument("--patch_dir", default="", help="extract_patches.py 출력 디렉토리")
     ap.add_argument("--n_genes",  default=2000, type=int, help="HVG 수 (default: 2000)")
     args = ap.parse_args()
     main(args)

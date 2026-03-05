@@ -1,1 +1,19 @@
+# 데이터/다운로드 (용량 큼)
 pre-training/datasets/downloads/
+pre-training/datasets/patches/
+
+# 전처리 결과물
+pre-training/datasets/rna_processed.pkl
+
+# 학습 출력 (체크포인트 등)
+pre-training/output_pretrain/
+
+# Python 캐시
+__pycache__/
+*.pyc
+*.pyo
+
+# 로그
+pre-training/patch_log.txt
+pre-training/pretrain_log.txt
+*.log

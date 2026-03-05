@@ -19,10 +19,11 @@ import utils.misc as misc
 from utils.misc import NativeScalerWithGradNormCount as NativeScaler
 import utils.lr_decay as lrd
 
-from data_loader import build_dataset
-from models_pomp import vit_base_patch16
+from utils.data_loader import build_dataset
+from model.models_pomp import vit_base_patch16
 from engine_multimodal_pretrain import train_one_epoch
-from utils.options import logger
+#from utils.options import logger
+import logging; logger = logging.getLogger(__name__); logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
 def set_seed(seed: int):

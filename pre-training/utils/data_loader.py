@@ -1,4 +1,5 @@
 # data_loader.py  ─ TCGA-LUAD (RNA-seq + WSI)
+import os
 import pickle
 import numpy as np
 import torch
@@ -25,22 +26,26 @@ class TCGALUADDataset(Dataset):
         return len(self.case_ids)
 
     def __getitem__(self, index):
-        # ── RNA-seq ──────────────────────────────────────────────────────────
         x_rna = torch.tensor(self.x_rna[index], dtype=torch.float32)
 
-        # ── WSI 패치 ─────────────────────────────────────────────────────────
         npy_path = self.wsi_paths[index]
-        regions  = np.load(npy_path)                  # (N, 3, 256, 256)
+        if not npy_path or not os.path.exists(npy_path):
+            raise FileNotFoundError(f"npy 파일 없음: '{npy_path}' (index={index})")
 
-        if regions.shape[0] > self.max_num_region:
-            # 랜덤 샘플링 (원본은 앞에서 자름 → 다양성을 위해 랜덤)
-            idx     = np.random.choice(regions.shape[0],
-                                       self.max_num_region, replace=False)
-            regions = regions[idx]
+        regions = np.load(npy_path, allow_pickle=True)
+        if regions.dtype == object:
+            regions = regions.item()
+
+        # 항상 max_num_region으로 맞춤 (부족하면 반복 샘플링)
+        n = regions.shape[0]
+        if n >= self.max_num_region:
+            idx = np.random.choice(n, self.max_num_region, replace=False)
+        else:
+            idx = np.random.choice(n, self.max_num_region, replace=True)  # ← 부족하면 반복
+        regions = regions[idx]  # 항상 (max_num_region, 3, 256, 256)
 
         regions = torch.tensor(regions, dtype=torch.float32)
-
-        return regions, x_rna   # (N, 3, 256, 256),  (n_genes,)
+        return regions, x_rna
 
 
 def build_dataset(pkl_path: str, max_num_region: int = 300) -> TCGALUADDataset:
