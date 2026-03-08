@@ -33,8 +33,8 @@ class POMPDataset(Dataset):
     pkl 키: x_rna, censored, survival, region_pixel_5x
     """
 
-    def __init__(self, data, split, loader=default_loader):
-
+    def __init__(self, data, split, loader=default_loader, max_num_region=250):
+        self.max_num_region = max_num_region
         if split == "all":
             self.X_rna  = np.concatenate([data[s]['x_rna']
                                            for s in ("train", "validation", "test")])
@@ -49,8 +49,6 @@ class POMPDataset(Dataset):
             self.censored        = data[split]['censored']         # (N,)
             self.survival        = data[split]['survival']         # (N,)
             self.region_pixel_5x = data[split]['region_pixel_5x'] # (N,) str paths
-
-        self.max_num_region = 250
 
     def __getitem__(self, index):
         single_censored = torch.tensor(self.censored[index]).type(torch.LongTensor)

@@ -4,6 +4,7 @@ from typing import Iterable, Optional
 
 import torch
 from timm.data import Mixup
+from tqdm import tqdm
 
 import utils.misc as misc
 import utils.lr_sched as lr_sched
@@ -36,7 +37,16 @@ def train_one_epoch(model: torch.nn.Module,
 
     # ── 원본: (regions, X_mrna, X_mirna, X_meth, censored, survival)
     # ── 수정: (regions, X_rna, censored, survival)
-    for data_iter_step, (regions, X_rna, censored, survival) in enumerate(data_loader):
+    data_loader_tqdm = tqdm(
+        enumerate(data_loader),
+        total=len(data_loader),
+        desc=f"Epoch {epoch}",
+        unit="it",
+        leave=False,
+        disable=(misc.get_rank() != 0),
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+    )
+    for data_iter_step, (regions, X_rna, censored, survival) in data_loader_tqdm:
 
         if (data_iter_step + 1) % accum_iter == 0:
             lr_sched.adjust_learning_rate(
@@ -47,7 +57,7 @@ def train_one_epoch(model: torch.nn.Module,
         censored = censored.to(device, non_blocking=True)
         survival = survival.to(device, non_blocking=True)
 
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast("cuda"):
             samples = [regions, X_rna]
             outputs1, image_embed, omics_embed = model(samples)
             outputs1 = outputs1.unsqueeze(1)
@@ -123,13 +133,21 @@ def evaluate(data_loader, model, device):
     censored_all = torch.tensor([], device=device)
     survival_all = torch.tensor([], device=device)
 
-    for regions, X_rna, censored, survival in data_loader:
+    data_loader_tqdm = tqdm(
+        data_loader,
+        total=len(data_loader),
+        desc="Eval",
+        unit="it",
+        leave=False,
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+    )
+    for regions, X_rna, censored, survival in data_loader_tqdm:
         regions  = regions.to(device,  non_blocking=True)
         X_rna    = X_rna.to(device,    non_blocking=True)
         censored = censored.to(device, non_blocking=True)
         survival = survival.to(device, non_blocking=True)
 
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast("cuda"):
             samples  = [regions, X_rna]
             outputs1, image_embed, omics_embed = model(samples)
             outputs2 = model.path_guided_omics_encoder(image_embed, omics_embed)

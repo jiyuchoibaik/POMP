@@ -1,3 +1,8 @@
+import datetime
+# Python 3.10 호환: datetime.UTC는 3.11에서 추가됨 (lifelines 호환용)
+if not hasattr(datetime, "UTC"):
+    datetime.UTC = datetime.timezone.utc
+
 import torch
 from lifelines.utils import concordance_index
 import numpy as np

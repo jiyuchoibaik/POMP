@@ -5,6 +5,7 @@ import numpy as np
 import math
 import timm.models.vision_transformer
 from timm.models.vision_transformer import Block
+from torch.utils.checkpoint import checkpoint
 
 # 원본: num_omics = 3 (mRNA, miRNA, meth)
 # 수정: num_omics = 1 (RNA-seq)
@@ -80,6 +81,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         self.linear      = nn.Linear(n_genes, self.embed_dim, bias=True)
         self.risk_head   = nn.Sequential(nn.Linear(self.embed_dim, 1), nn.Sigmoid())
         self.gap         = GlobalAttentionPooling(self.embed_dim, self.embed_dim)
+        self.gradient_checkpointing = False  # OOM 시 True로 (메모리↓, 속도 약간↓)
 
         self.vits = nn.ModuleList([
             Block(self.embed_dim, num_heads=6, mlp_ratio=4,
@@ -122,7 +124,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         reg_emb = self.patch_embed(regions)
         reg_emb = self.pos_drop(reg_emb)
         for blk in self.vits:
-            reg_emb = blk(reg_emb)
+            reg_emb = checkpoint(blk, reg_emb, use_reentrant=False) if self.gradient_checkpointing else blk(reg_emb)
         reg_emb = self.norm_vits(reg_emb)
         img = torch.mean(reg_emb, dim=1)  # (N_patch, D)
 
@@ -133,7 +135,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
 
         img = self.pos_drop(img)
         for blk in self.img_transf:
-            img = blk(img)
+            img = checkpoint(blk, img, use_reentrant=False) if self.gradient_checkpointing else blk(img)
         img     = self.norm_img_transf(img)
         img_cls = img[0, 0:1, :]                       # (1, 1, D)
 
@@ -144,7 +146,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
 
         X_omics = self.pos_drop(X_omics)
         for blk in self.omics_transf:
-            X_omics = blk(X_omics)
+            X_omics = checkpoint(blk, X_omics, use_reentrant=False) if self.gradient_checkpointing else blk(X_omics)
         X_omics   = self.norm_omics_transf(X_omics)
         omics_cls = X_omics[0, 0:1, :]                # (1, 1, D)
 

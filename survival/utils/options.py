@@ -144,7 +144,9 @@ def create_logger():
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 
     # 创建一个handler，用于写入日志文件
-    args = get_args_parser_finetune().parse_args()
+    # parse_known_args: main_multimodal_survival.py 전용 인자(--prefetch_factor 등) 허용
+    args, _ = get_args_parser_finetune().parse_known_args()
+    os.makedirs(args.output_dir, exist_ok=True)
     now = datetime.datetime.now()
     file_handler = logging.FileHandler(filename=os.path.join(args.output_dir,
                                     "log-{}-{}.log".format(args.exptype, now.strftime("%Y-%m-%d %H:%M:%S"))))
