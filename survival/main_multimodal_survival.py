@@ -64,7 +64,11 @@ def main(args):
     for _k, data in data_cv_splits.items():
 
         logger.info("=" * 60)
-        logger.info(f"5-fold Cross-validation ({_k+1}/{len(data_cv_splits)})")
+        n_folds = len(data_cv_splits)
+        if n_folds == 1:
+            logger.info("Single split (1/1)")
+        else:
+            logger.info(f"5-fold Cross-validation ({_k+1}/{n_folds})")
         logger.info("=" * 60)
 
         set_seed(args.seed)
@@ -147,7 +151,7 @@ def main(args):
             model.load_state_dict(torch.load(best_model_path, map_location=device, weights_only=False))
             logger.info(f"평가용 모델 로드: {best_model_path}")
             test_stats, pred, censored, survival = evaluate(data_loader_test, model, device)
-            logger.info(f"Fold {_k+1}/5  test c-index: {test_stats['c-index']:.4f}, p-value: {test_stats['p-value']:.10f}")
+            logger.info(f"Fold {_k+1}/{n_folds}  test c-index: {test_stats['c-index']:.4f}, p-value: {test_stats['p-value']:.10f}")
             best_predict.append([
                 float(test_stats['c-index']), float(test_stats['p-value']),
             ])
@@ -168,7 +172,7 @@ def main(args):
 
         epoch_range = tqdm(
             range(args.start_epoch, args.epochs),
-            desc=f"Fold {_k+1}/5 Epoch",
+            desc=f"Fold {_k+1}/{n_folds} Epoch",
             unit="epoch",
             leave=True,
             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",

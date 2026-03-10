@@ -5,13 +5,21 @@ Step 3: luad_cv_splits.pkl 생성
   - WSI regions.npy 경로
   → survival/datasets/luad_cv_splits.pkl
 
-사용법:
+사용법 (5-fold):
   python build_survival_pkl.py \
     --rna_pkl    ./datasets/rna_processed.pkl \
     --clinical   ./downloads/clinical.csv \
     --patch_dir  ./datasets/patches \
     --out        ./survival/datasets/luad_cv_splits.pkl \
     --n_folds    5 \
+    --seed       42
+
+단일 분할 (train/val/test 한 번만):
+  python build_survival_pkl.py \
+    --rna_pkl    ... --clinical ... --patch_dir ... \
+    --out        ./survival/datasets/luad_single_splits.pkl \
+    --n_folds    1 \
+    --train_ratio 0.7 --val_ratio 0.15 --test_ratio 0.15 \
     --seed       42
 """
 
@@ -48,6 +56,27 @@ def find_regions_npy(patch_dir: str, case_id: str) -> str:
     """patch_dir/{case_id}/regions.npy 경로 반환"""
     path = os.path.join(patch_dir, case_id, "regions.npy")
     return path if os.path.exists(path) else ""
+
+
+def build_single_split(case_ids, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
+    """
+    한 번만 나누기: train / val / test 비율로 1회 분할.
+    Returns: [ {train: [...], validation: [...], test: [...]} ]
+    """
+    assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6
+    random.seed(seed)
+    np.random.seed(seed)
+    shuffled = case_ids.copy()
+    random.shuffle(shuffled)
+    n = len(shuffled)
+    n_train = int(n * train_ratio)
+    n_val   = int(n * val_ratio)
+    n_test  = n - n_train - n_val
+    return [{
+        "train":      shuffled[:n_train],
+        "validation": shuffled[n_train : n_train + n_val],
+        "test":       shuffled[n_train + n_val :],
+    }]
 
 
 def build_splits(case_ids, n_folds=5, seed=42):
@@ -146,8 +175,18 @@ def main(args):
           f"median={sorted(survivals)[len(survivals)//2]:.0f}d, "
           f"max={max(survivals):.0f}d")
 
-    print(f"\n[4] {args.n_folds}-fold 분할 생성...")
-    splits = build_splits(valid_ids, n_folds=args.n_folds, seed=args.seed)
+    if args.n_folds == 1:
+        print(f"\n[4] 단일 분할 (train/val/test = {args.train_ratio:.0%}/{args.val_ratio:.0%}/{args.test_ratio:.0%})...")
+        splits = build_single_split(
+            valid_ids,
+            train_ratio=args.train_ratio,
+            val_ratio=args.val_ratio,
+            test_ratio=args.test_ratio,
+            seed=args.seed,
+        )
+    else:
+        print(f"\n[4] {args.n_folds}-fold 분할 생성...")
+        splits = build_splits(valid_ids, n_folds=args.n_folds, seed=args.seed)
 
     data_cv_splits = {}
     for k, split in enumerate(splits):
@@ -175,7 +214,11 @@ if __name__ == "__main__":
     ap.add_argument("--clinical",  required=True, help="download_clinical.py 출력 csv")
     ap.add_argument("--patch_dir", required=True, help="extract_patches.py 출력 디렉토리")
     ap.add_argument("--out",       default="./survival/datasets/luad_cv_splits.pkl")
-    ap.add_argument("--n_folds",   default=5, type=int)
+    ap.add_argument("--n_folds",   default=5, type=int,
+                    help="1이면 단일 분할(train/val/test 비율), 2 이상이면 k-fold")
+    ap.add_argument("--train_ratio", default=0.7, type=float, help="n_folds=1일 때 train 비율")
+    ap.add_argument("--val_ratio",   default=0.15, type=float, help="n_folds=1일 때 validation 비율")
+    ap.add_argument("--test_ratio", default=0.15, type=float, help="n_folds=1일 때 test 비율")
     ap.add_argument("--seed",      default=42, type=int)
     args = ap.parse_args()
     main(args)
