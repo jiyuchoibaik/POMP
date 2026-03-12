@@ -78,6 +78,7 @@ def extract_patches(svs_path: str, out_npy: str,
     ds       = slide.level_downsamples[level]
 
     patches = []
+    coords  = []  # level0 기준 (x0, y0), WSI 원본 위 attention 시각화용
     n_x = lw // patch_size
     n_y = lh // patch_size
 
@@ -93,6 +94,7 @@ def extract_patches(svs_path: str, out_npy: str,
             if is_tissue(arr):
                 # (H, W, C) → (C, H, W), float32 [0,1]
                 patches.append(arr.transpose(2, 0, 1).astype(np.float32) / 255.0)
+                coords.append([x0, y0])
 
             if len(patches) >= max_patches:
                 break
@@ -106,8 +108,57 @@ def extract_patches(svs_path: str, out_npy: str,
         return False
 
     patches_arr = np.stack(patches, axis=0)  # (N, 3, 256, 256)
-    os.makedirs(os.path.dirname(out_npy), exist_ok=True)
+    coords_arr  = np.array(coords, dtype=np.int64)   # (N, 2) level0 픽셀
+    out_dir = os.path.dirname(out_npy)
+    os.makedirs(out_dir, exist_ok=True)
     np.save(out_npy, patches_arr)
+    np.savez(os.path.join(out_dir, "coords.npz"), coords=coords_arr, downsample=float(ds), patch_size=patch_size)
+    return True
+
+
+def extract_coords_only(svs_path: str, out_coords_npy: str,
+                        mag: int = 5, patch_size: int = 256,
+                        max_patches: int = 300) -> bool:
+    """
+    이미 존재하는 regions.npy와 동일한 순서로 coords.npz만 생성.
+    (과거에 좌표 없이 추출한 경우, WSI 원본 위 시각화를 위해 사용)
+    """
+    out_npz = out_coords_npy.replace(".npy", ".npz")
+    if os.path.exists(out_npz):
+        return True
+    try:
+        slide = openslide.OpenSlide(svs_path)
+    except Exception:
+        return False
+
+    level = get_best_level(slide, mag)
+    lw, lh = slide.level_dimensions[level]
+    ds = slide.level_downsamples[level]
+
+    coords = []
+    n_x = lw // patch_size
+    n_y = lh // patch_size
+
+    for yi in range(n_y):
+        for xi in range(n_x):
+            x0 = int(xi * patch_size * ds)
+            y0 = int(yi * patch_size * ds)
+            region = slide.read_region((x0, y0), level, (patch_size, patch_size))
+            arr = np.array(region.convert("RGB"))
+            if is_tissue(arr):
+                coords.append([x0, y0])
+            if len(coords) >= max_patches:
+                break
+        if len(coords) >= max_patches:
+            break
+    slide.close()
+
+    if len(coords) == 0:
+        return False
+    coords_arr = np.array(coords, dtype=np.int64)
+    out_dir = os.path.dirname(out_coords_npy)
+    os.makedirs(out_dir, exist_ok=True)
+    np.savez(out_npz, coords=coords_arr, downsample=float(ds), patch_size=patch_size)
     return True
 
 
@@ -115,6 +166,28 @@ def main(args):
     # mapping.csv 읽기
     with open(args.mapping) as f:
         mapping = [r for r in csv.DictReader(f) if r["paired"] == "True"]
+
+    if getattr(args, "coords_only", False):
+        print("[INFO] 기존 regions.npy에 맞춰 coords.npy만 생성")
+        ok = fail = 0
+        for row in tqdm(mapping, desc="coords 생성"):
+            cid = row["case_id"]
+            wsi_name = row["wsi_file_name"]
+            svs_path = os.path.join(args.wsi_dir, cid, wsi_name)
+            out_coords = os.path.join(args.out_dir, cid, "coords.npy")
+            out_regions = os.path.join(args.out_dir, cid, "regions.npy")
+            if not os.path.exists(out_regions):
+                fail += 1
+                continue
+            if not os.path.exists(svs_path):
+                fail += 1
+                continue
+            if extract_coords_only(svs_path, out_coords, args.mag, args.patch_size, args.max_patches):
+                ok += 1
+            else:
+                fail += 1
+        print(f"[DONE] coords.npy 성공: {ok} | 실패: {fail}")
+        return
 
     print(f"[INFO] 패치 추출 대상: {len(mapping)}개")
     ok = fail = 0
@@ -148,5 +221,7 @@ if __name__ == "__main__":
     ap.add_argument("--mag",         default=5,   type=int, help="목표 배율 (default: 5x)")
     ap.add_argument("--patch_size",  default=256, type=int)
     ap.add_argument("--max_patches", default=300, type=int)
+    ap.add_argument("--coords_only", action="store_true",
+                    help="regions.npy는 이미 있을 때 coords.npy만 생성 (WSI 원본 시각화용)")
     args = ap.parse_args()
     main(args)

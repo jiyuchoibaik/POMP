@@ -54,7 +54,8 @@ def get_args():
                     help="gradient accumulation = effective batch size")
     ap.add_argument("--mask_ratio",  default=0.3,  type=float,
                     help="gene masking 비율 (MOM)")
-    ap.add_argument("--num_workers", default=8,    type=int)
+    ap.add_argument("--num_workers", default=24,    type=int,
+                    help="DataLoader 워커 수. GPU 풀가동 시 24~32 권장 (CPU 코어 여유 있을 때)")
 
     # 옵티마이저
     ap.add_argument("--lr",          default=5e-4, type=float)
@@ -100,13 +101,16 @@ def main(args):
 
     # ── 데이터셋 ────────────────────────────────────────────────────────────
     dataset = build_dataset(args.data_pkl, max_num_region=args.max_patches)
+    nw = args.num_workers
     data_loader = torch.utils.data.DataLoader(
         dataset,
-        batch_size  = args.batch_size,
-        num_workers = args.num_workers,
-        pin_memory  = args.pin_mem,
-        shuffle     = True,
-        drop_last   = False,
+        batch_size       = args.batch_size,
+        num_workers      = nw,
+        pin_memory       = args.pin_mem,
+        shuffle          = True,
+        drop_last        = False,
+        prefetch_factor  = 8 if nw > 0 else None,
+        persistent_workers = nw > 0,
     )
 
     # ── TensorBoard ─────────────────────────────────────────────────────────

@@ -8,6 +8,10 @@ survival/datasets/luad_cv_splits.pkl
 
 # ========== 학습/평가 출력 (체크포인트, 로그, TensorBoard) ==========
 pre-training/output_pretrain/
+pre-training/output_pretrain_2/
+pre-training/output_pretrain_3/
+
+
 output_finetune/
 output_finetune_dir/
 *.pth
@@ -17,6 +21,8 @@ events.out.tfevents.*
 # ========== 로그 ==========
 pre-training/patch_log.txt
 pre-training/pretrain_log.txt
+pre-training/pretrain2_log.txt
+pre-training/nohup_v3.out
 *.log
 
 # ========== Python ==========

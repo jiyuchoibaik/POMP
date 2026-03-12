@@ -55,7 +55,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         self.pom_head   = nn.Linear(self.embed_dim, 2)
         self.mom_head   = nn.Linear(self.embed_dim, rna_dim)
 
-        self.vits = nn.ModuleList([
+        self.vits = nn.ModuleList([ # 파이썬의 일반적인 리스트랑 똑같이 생각. my_list = [Block1, Block2]
             Block(self.embed_dim, num_heads=6, mlp_ratio=4,
                   qkv_bias=True, norm_layer=nn.LayerNorm)
             for _ in range(2)
@@ -140,7 +140,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
     def path_guided_omics_encoder(self, image_embed, omics_embed, mask_ratio=0.3):
         """
         Args:
-            image_embed  : (1, seq, D)
+            image_embed  : (1, seq, D) 즉, (B, 1 + N, 384)
             omics_embed  : (1, 2, D)
         Returns:
             logit_mask : (1, rna_dim)
@@ -162,6 +162,71 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
     def forward(self, x):
         img_cls, omics_cls, img_embed, omics_embed = self.forward_features(x)
         return img_cls, omics_cls, img_embed, omics_embed
+
+    def get_image_cls_region_attention(self, regions):
+        """
+        이미지 브랜치만 통과시켜, 마지막 img_transf block에서 CLS(0번) → region(1..N) attention 반환.
+        멀티모달 vs 유니모달 WSI 집중 영역 비교용.
+        Args:
+            regions: (B, N, 3, 256, 256)
+        Returns:
+            attn: (B, N) numpy, 각 region에 대한 attention (합=1)
+        """
+        B, N = regions.shape[0], regions.shape[1]
+        regions = regions.view(B * N, 3, 256, 256)
+
+        reg_emb = self.patch_embed(regions)
+        reg_emb = self.pos_drop(reg_emb)
+        for blk in self.vits:
+            reg_emb = blk(reg_emb)
+        reg_emb = self.norm_vits(reg_emb)
+        img = torch.mean(reg_emb, dim=1).view(B, N, self.embed_dim)
+
+        cls_tokens = self.cls_token.unsqueeze(0).expand(B, 1, -1)
+        img = torch.cat([cls_tokens, img], dim=1)
+        pe = PositionalEncoding(self.embed_dim, img.shape[1]).to(img.device)
+        img = pe(img)
+        img = self.pos_drop(img)
+
+        for blk in self.img_transf[:-1]:
+            img = blk(img)
+
+        last_block = self.img_transf[-1]
+        x_norm = last_block.norm1(img)
+        qkv = last_block.attn.qkv(x_norm)
+        num_heads = getattr(last_block.attn, "num_heads", 3)
+        head_dim = self.embed_dim // num_heads
+        qkv = qkv.reshape(B, img.shape[1], 3, num_heads, head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        scale = head_dim ** -0.5
+        attn = (q @ k.transpose(-2, -1)) * scale
+        attn = attn.softmax(dim=-1)
+        attn = attn.detach()
+        cls_to_region = attn[:, :, 0, 1:].mean(dim=1)
+        return cls_to_region.cpu().float().numpy()
+
+    def forward_image_only(self, regions):
+        """
+        이미지 브랜치만 통과, slide-level CLS 벡터 반환 (유니모달 SSL 학습용).
+        regions: (B, N, 3, 256, 256) -> (B, D)
+        """
+        B, N = regions.shape[0], regions.shape[1]
+        regions = regions.view(B * N, 3, 256, 256)
+        reg_emb = self.patch_embed(regions)
+        reg_emb = self.pos_drop(reg_emb)
+        for blk in self.vits:
+            reg_emb = blk(reg_emb)
+        reg_emb = self.norm_vits(reg_emb)
+        img = torch.mean(reg_emb, dim=1).view(B, N, self.embed_dim)
+        cls_tokens = self.cls_token.unsqueeze(0).expand(B, 1, -1)
+        img = torch.cat([cls_tokens, img], dim=1)
+        pe = PositionalEncoding(self.embed_dim, img.shape[1]).to(img.device)
+        img = pe(img)
+        img = self.pos_drop(img)
+        for blk in self.img_transf:
+            img = blk(img)
+        img = self.norm_img_transf(img)
+        return img[:, 0]
 
 
 def vit_base_patch16(rna_dim: int = 2000, **kwargs):

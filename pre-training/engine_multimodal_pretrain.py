@@ -67,13 +67,21 @@ def train_one_epoch(model: torch.nn.Module,
             img_cls, omics_cls, image_embed, omics_embed = model(samples)
 
         # img_cls, omics_cls: (B, 1, D) → squeeze to (B, D)
+        # POC용 feature: 누적 시 detach하여 그래프 유지로 인한 gradient 불안정 방지.
+        # 마지막 스텝만 grad 유지 (contrastive loss는 마지막 forward로만 역전파).
         k += 1
+        is_last_accum = (k == accum_iter - 1)
+        _img_cls = img_cls.squeeze(1)
+        _omics_cls = omics_cls.squeeze(1)
+        if not is_last_accum:
+            _img_cls = _img_cls.detach()
+            _omics_cls = _omics_cls.detach()
         if k == 0:
-            omics_feats = omics_cls.squeeze(1)
-            image_feats = img_cls.squeeze(1)
+            omics_feats = _omics_cls
+            image_feats = _img_cls
         else:
-            omics_feats = torch.cat([omics_feats, omics_cls.squeeze(1)], dim=0)
-            image_feats = torch.cat([image_feats, img_cls.squeeze(1)],   dim=0)
+            omics_feats = torch.cat([omics_feats, _omics_cls], dim=0)
+            image_feats = torch.cat([image_feats, _img_cls], dim=0)
 
         # image_embed, omics_embed를 배치별로 분리해서 저장
         for b in range(img_cls.shape[0]):
@@ -98,20 +106,17 @@ def train_one_epoch(model: torch.nn.Module,
             loss_poc = (F.cross_entropy(sim_i2o, labels_poc) +
                         F.cross_entropy(sim_o2i, labels_poc)) / 2
 
-            # ── 2. MOM: Masked Omics Modeling ─────────────────────────────
+            # ── 2. MOM + POM positive: path_guided_omics_encoder 배치 한 번에 호출 ─
             rna_mask_stack = torch.cat(rna_masks, dim=0)  # (effective_batch, rna_dim)
-            logits_mask_list, logits_cls_list = [], []
+            image_embeds_batch = torch.cat(image_embeds, dim=0)   # (effective_batch, seq, D)
+            omics_embeds_batch = torch.cat(omics_embeds, dim=0)   # (effective_batch, 2, D)
 
-            for b in range(effective_batch):
-                logit_mask, logit_cls = model.path_guided_omics_encoder(
-                    image_embeds[b], omics_embeds[b])
-                logits_mask_list.append(logit_mask)   # (1, rna_dim)
-                logits_cls_list.append(logit_cls)     # (1, 2)
-
-            logits_mask_stack = torch.cat(logits_mask_list, dim=0)  # (effective_batch, rna_dim)
+            logits_mask_stack, logits_cls_pos = model.path_guided_omics_encoder(
+                image_embeds_batch, omics_embeds_batch)
+            # logits_mask_stack (effective_batch, rna_dim), logits_cls_pos (effective_batch, 2)
             loss_mom = F.mse_loss(logits_mask_stack, rna_mask_stack)
 
-            # ── 3. POM: Pathology-Omics Matching ──────────────────────────
+            # ── 3. POM: Pathology-Omics Matching (negative 샘플링도 배치로) ─────
             with torch.no_grad():
                 weights_i2o = F.softmax(sim_i2o, dim=1).clone()
                 weights_o2i = F.softmax(sim_o2i, dim=1).clone()
@@ -119,31 +124,32 @@ def train_one_epoch(model: torch.nn.Module,
                 weights_o2i.fill_diagonal_(0)
 
             try:
-                for b in range(effective_batch):
-                    neg_idx = torch.multinomial(weights_o2i[b], 1).item()
-                    _, logit_cls = model.path_guided_omics_encoder(
-                        image_embeds[neg_idx], omics_embeds[b])
-                    logits_cls_list.append(logit_cls)
+                neg_idx_o2i = torch.stack(
+                    [torch.multinomial(weights_o2i[b], 1).squeeze(0) for b in range(effective_batch)])
+                neg_idx_i2o = torch.stack(
+                    [torch.multinomial(weights_i2o[b], 1).squeeze(0) for b in range(effective_batch)])
 
-                for b in range(effective_batch):
-                    neg_idx = torch.multinomial(weights_i2o[b], 1).item()
-                    _, logit_cls = model.path_guided_omics_encoder(
-                        image_embeds[b], omics_embeds[neg_idx])
-                    logits_cls_list.append(logit_cls)
+                image_neg_batch = torch.cat(
+                    [image_embeds[neg_idx_o2i[b].item()] for b in range(effective_batch)], dim=0)
+                _, logits_cls_neg1 = model.path_guided_omics_encoder(
+                    image_neg_batch, omics_embeds_batch)
 
+                omics_neg_batch = torch.cat(
+                    [omics_embeds[neg_idx_i2o[b].item()] for b in range(effective_batch)], dim=0)
+                _, logits_cls_neg2 = model.path_guided_omics_encoder(
+                    image_embeds_batch, omics_neg_batch)
             except Exception as e:
                 image_embeds, omics_embeds, rna_masks = [], [], []
                 omics_feats = image_feats = None
                 logger.info(f"POM negative sampling 오류: {e}")
                 continue
 
-            effective_batch = len(logits_cls_list) // 3
+            logits_cls_stack = torch.cat(
+                [logits_cls_pos, logits_cls_neg1, logits_cls_neg2], dim=0)
             itm_labels = torch.cat([
                 torch.ones(effective_batch,    dtype=torch.long),
-                torch.zeros(2*effective_batch, dtype=torch.long)
+                torch.zeros(2 * effective_batch, dtype=torch.long)
             ], dim=0).to(device)
-
-            logits_cls_stack = torch.cat(logits_cls_list, dim=0)
             loss_pom = F.cross_entropy(logits_cls_stack, itm_labels)
 
             # buffer reset
@@ -154,8 +160,8 @@ def train_one_epoch(model: torch.nn.Module,
             loss = loss_poc * 1.0 + loss_pom * 6.0 + loss_mom * 3.0
 
             metric_logger.update(loss_poc=loss_poc.item())
-            metric_logger.update(loss_pom=loss_pom.item() * 6.0)
-            metric_logger.update(loss_mom=loss_mom.item() * 3.0)
+            metric_logger.update(loss_pom=loss_pom.item())   # 원값 저장 (플롯용)
+            metric_logger.update(loss_mom=loss_mom.item())
 
             loss_value = loss.item()
             if not math.isfinite(loss_value):

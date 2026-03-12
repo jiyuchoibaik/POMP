@@ -38,6 +38,7 @@ class CrossAttention(nn.Module):
     def forward(self, query, key, value):
         attn = torch.matmul(self.q(query), self.k(key).transpose(-1, -2)) * self.scale
         attn = torch.softmax(attn, dim=-1)
+        self.last_attn = attn.detach()  # 시각화용: (B, num_queries, num_keys)
         return torch.matmul(attn, self.v(value))
 
 
@@ -173,6 +174,35 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
     def forward(self, x):
         corr, image_embed, omics_embed = self.forward_features(x)
         return corr, image_embed, omics_embed
+
+    def get_patch_spatial_attention(self, patch_tensor):
+        """
+        단일 패치 (1, 3, 256, 256)에 대해 ViT 마지막 block의 self-attention을 공간 맵으로 반환.
+        시각화용: 패치 내 어느 위치가 중요한지 (16, 16) → 업샘플해서 오버레이.
+
+        Returns:
+            importance: (16, 16) numpy, 각 16x16 토큰 위치의 "중요도" (다른 토큰들이 이 위치에 준 attention 합)
+        """
+        with torch.no_grad():
+            reg_emb = self.patch_embed(patch_tensor)   # (1, 256, D)
+            reg_emb = self.pos_drop(reg_emb)
+            for blk in self.vits[:-1]:
+                reg_emb = blk(reg_emb)
+            last_blk = self.vits[-1]
+            x = last_blk.norm1(reg_emb)
+            B, N, C = x.shape
+            qkv = last_blk.attn.qkv(x)
+            num_heads = last_blk.attn.num_heads
+            head_dim = C // num_heads
+            qkv = qkv.reshape(B, N, 3, num_heads, head_dim).permute(2, 0, 3, 1, 4)
+            q, k, v = qkv[0], qkv[1], qkv[2]
+            scale = head_dim ** -0.5
+            attn = (q @ k.transpose(-2, -1)) * scale
+            attn = attn.softmax(dim=-1)   # (1, num_heads, N, N); [i,j] = i가 j에게 준 attention
+            # 토큰 j에 대한 "중요도" = 다른 모든 토큰이 j에게 준 attention 합 → (N,)
+            importance = attn.sum(dim=1).sum(dim=1).squeeze(0)   # heads 제거 후 "from" 차원 합
+            importance = importance.cpu().numpy().reshape(16, 16)
+        return importance
 
 
 def vit_base_patch16(**kwargs):
