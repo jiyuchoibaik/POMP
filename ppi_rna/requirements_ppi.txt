@@ -1,0 +1,4 @@
+# PPI RNA 전처리 및 학습용 추가 의존성 (기존 pre-training 환경 위에 설치)
+networkx
+python-louvain  # 또는: louvain
+requests

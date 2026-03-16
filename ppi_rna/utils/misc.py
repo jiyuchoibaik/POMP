@@ -66,7 +66,7 @@ class SmoothedValue(object):
 
     @property
     def global_avg(self):
-        return self.total / self.count if self.count else 0.0
+        return self.total / self.count
 
     @property
     def max(self):
@@ -249,7 +249,6 @@ def init_distributed_mode(args):
     torch.distributed.barrier()
     setup_for_distributed(args.rank == 0)
 
-
 class NativeScalerWithGradNormCount:
     state_dict_key = "amp_scaler"
 
@@ -257,7 +256,7 @@ class NativeScalerWithGradNormCount:
         self._scaler = torch.cuda.amp.GradScaler()
 
     def __call__(self, loss, optimizer, clip_grad=None, parameters=None, create_graph=False, update_grad=True):
-        self._scaler.scale(loss).backward(create_graph=create_graph)
+        self._scaler.scale(loss).backward(retain_graph=False, create_graph=create_graph)
         if update_grad:
             if clip_grad is not None:
                 assert parameters is not None
@@ -298,7 +297,7 @@ def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler):
     output_dir = Path(args.output_dir)
     epoch_name = str(epoch)
     if loss_scaler is not None:
-        checkpoint_paths = [output_dir / ('checkpoint-{}.pth'.format(epoch_name))]
+        checkpoint_paths = [output_dir / (f'checkpoint-{args.exptype}-{epoch_name}.pth')]
         for checkpoint_path in checkpoint_paths:
             to_save = {
                 'model': model_without_ddp.state_dict(),
@@ -320,8 +319,9 @@ def load_model(args, model_without_ddp, optimizer, loss_scaler):
             checkpoint = torch.hub.load_state_dict_from_url(
                 args.resume, map_location='cpu', check_hash=True)
         else:
-            checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
-        model_without_ddp.load_state_dict(checkpoint['model_backup'])
+            checkpoint = torch.load(args.resume, map_location='cpu')
+        state_key = 'model' if 'model' in checkpoint else 'model_backup'
+        model_without_ddp.load_state_dict(checkpoint[state_key])
         print("Resume checkpoint %s" % args.resume)
         if 'optimizer' in checkpoint and 'epoch' in checkpoint and not (hasattr(args, 'eval') and args.eval):
             optimizer.load_state_dict(checkpoint['optimizer'])

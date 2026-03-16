@@ -1,13 +1,15 @@
 """
 Step 1: RNA-seq 전처리
-  STAR Counts TSV → HVG 선택 → log1p 정규화 → pickle 저장
+  STAR Counts TSV → HVG 선택 → z-score 정규화 (전체 환자 평균/표준편차 기준) → pickle 저장
+  ※ pkl에 hvg_genes_mean, hvg_genes_std 를 함께 저장하여 fine-tuning 시 동일 정규화 적용 가능
 
-사용법:
-  python preprocess_rna.py \
-    --rna_dir   ./downloads/rnaseq \
-    --mapping   ./downloads/mapping.csv \
-    --out       ./datasets/rna_processed.pkl \
+사용법 (pre-training 폴더에서 실행 시, 데이터가 datasets/downloads/ 에 있을 때):
+  python datasets/preprocess_rna.py \
+    --rna_dir   ./datasets/downloads/rnaseq \
+    --mapping   ./datasets/downloads/mapping.csv \
+    --out       ./datasets/rna_processed_zscore.pkl \
     --n_genes   2000
+  (z-score 버전은 rna_processed_zscore.pkl 등 다른 이름 권장, 기존 log1p pkl 유지)
 """
 
 import os
@@ -16,6 +18,7 @@ import math
 import pickle
 import argparse
 import glob
+import numpy as np
 from collections import defaultdict
 
 
@@ -68,15 +71,32 @@ def select_hvg(all_counts: dict, n_genes: int = 2000) -> list:
     return scored[:n_genes]
 
 
-def log1p_normalize(counts: dict, hvg_genes: list) -> list:
+# def log1p_normalize(counts: dict, hvg_genes: list) -> list:
+#     """[변경 전] 선택된 HVG에 대해 log1p 정규화 후 리스트 반환"""
+#     return [math.log1p(counts.get(g, 0.0)) for g in hvg_genes]
+
+
+def zscore_normalize(matrix, axis=0, eps=1e-8):
     """
-    선택된 HVG에 대해 log1p 정규화 후 리스트 반환
+    전체 환자(axis=0) 기준 평균, 표준편차로 z-score 정규화.
+    axis=0: 각 유전자(열)에 대해 환자들(행) 방향으로 평균/표준편차 계산.
     """
-    return [math.log1p(counts.get(g, 0.0)) for g in hvg_genes]
+    mean = matrix.mean(axis=axis, keepdims=True)
+    std = matrix.std(axis=axis, keepdims=True)
+    std = np.where(std < eps, 1.0, std)  # std 0이면 1로 대체 (div by zero 방지)
+    return (matrix - mean) / std, mean.squeeze(axis).tolist(), std.squeeze(axis).tolist()
 
 
 def main(args):
-    # mapping.csv 읽기
+    # mapping.csv 읽기 (없으면 경로 안내 후 종료)
+    mapping_path = os.path.abspath(args.mapping)
+    if not os.path.isfile(mapping_path):
+        raise FileNotFoundError(
+            f"mapping 파일 없음: {args.mapping}\n"
+            f"  절대경로: {mapping_path}\n"
+            f"  download_multimodal.py 로 다운로드 후 mapping.csv가 생성됩니다. "
+            f"--mapping 에 실제 파일 경로를 지정하세요."
+        )
     mapping = []
     with open(args.mapping) as f:
         mapping = list(csv.DictReader(f))
@@ -111,10 +131,21 @@ def main(args):
     # HVG 선택
     hvg_genes = select_hvg(case_counts, n_genes=args.n_genes)
 
-    # 정규화
-    rna_vectors = {}
-    for cid, counts in case_counts.items():
-        rna_vectors[cid] = log1p_normalize(counts, hvg_genes)
+    # [변경 전] log1p 정규화
+    # rna_vectors = {}
+    # for cid, counts in case_counts.items():
+    #     rna_vectors[cid] = log1p_normalize(counts, hvg_genes)
+
+    # z-score 정규화: 먼저 log1p 스케일로 (N, n_genes) 행렬 구성 후, 전체 환자 기준 평균/표준편차로 z-score
+    case_ids_ordered = list(case_counts.keys())
+    n_cases = len(case_ids_ordered)
+    log1p_matrix = np.zeros((n_cases, len(hvg_genes)), dtype=np.float64)
+    for i, cid in enumerate(case_ids_ordered):
+        counts = case_counts[cid]
+        for j, g in enumerate(hvg_genes):
+            log1p_matrix[i, j] = math.log1p(counts.get(g, 0.0))
+    x_rna_z, hvg_genes_mean, hvg_genes_std = zscore_normalize(log1p_matrix, axis=0)
+    rna_vectors = {cid: x_rna_z[i].tolist() for i, cid in enumerate(case_ids_ordered)}
 
     # WSI 경로 매핑
     wsi_paths = {}
@@ -125,13 +156,15 @@ def main(args):
                 args.wsi_dir, cid, "regions.npy"
             ) if args.wsi_dir else ""
 
-    # 저장
+    # 저장 (fine-tuning 시 동일 z-score 적용을 위해 전체 환자 기준 평균/표준편차 포함)
     result = {
-        "case_ids":  list(rna_vectors.keys()),
-        "x_rna":     [rna_vectors[c] for c in rna_vectors],
-        "wsi_paths": [wsi_paths.get(c, "") for c in rna_vectors],
-        "hvg_genes": hvg_genes,
-        "n_genes":   args.n_genes,
+        "case_ids":        list(rna_vectors.keys()),
+        "x_rna":           [rna_vectors[c] for c in rna_vectors],
+        "wsi_paths":       [wsi_paths.get(c, "") for c in rna_vectors],
+        "hvg_genes":       hvg_genes,
+        "n_genes":         args.n_genes,
+        "hvg_genes_mean":  hvg_genes_mean,   # 유전자별 전체 환자 평균 (z-score용)
+        "hvg_genes_std":  hvg_genes_std,    # 유전자별 전체 환자 표준편차 (z-score용)
     }
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
@@ -140,15 +173,18 @@ def main(args):
 
     print(f"[DONE] 저장: {args.out}")
     print(f"  케이스 수  : {len(result['case_ids'])}")
-    print(f"  RNA 차원   : {args.n_genes}")
+    print(f"  RNA 차원   : {args.n_genes} (z-score 정규화)")
+    print(f"  hvg_genes_mean/std 저장됨 → fine-tuning 시 동일 정규화 적용 가능")
     print(f"  예시 벡터  : {result['x_rna'][0][:5]} ...")
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--rna_dir",  required=True, help="downloads/rnaseq 경로")
-    ap.add_argument("--mapping",  required=True, help="downloads/mapping.csv 경로")
-    ap.add_argument("--out",      default="./datasets/rna_processed.pkl")
+    ap.add_argument("--rna_dir",  required=True, help="rnaseq TSV 디렉터리 (예: ./datasets/downloads/rnaseq)")
+    ap.add_argument("--mapping",  required=True, help="mapping.csv 경로 (예: ./datasets/downloads/mapping.csv)")
+    ap.add_argument("--wsi_dir",  default="", help="WSI regions.npy 루트 (미지정 시 wsi_paths는 빈 문자열)")
+    ap.add_argument("--out",      default="./datasets/rna_processed_zscore.pkl",
+                    help="z-score 버전은 별도 파일명 권장 (기존 rna_processed.pkl 덮어쓰지 않음)")
     ap.add_argument("--patch_dir", default="", help="extract_patches.py 출력 디렉토리")
     ap.add_argument("--n_genes",  default=2000, type=int, help="HVG 수 (default: 2000)")
     args = ap.parse_args()

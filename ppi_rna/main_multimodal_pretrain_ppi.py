@@ -1,10 +1,10 @@
-# main_multimodal_pretrain_2.py  ─ engine_2 사용 (POC=unmasked RNA, loss 스케일 맞춤)
-# 기존 main_multimodal_pretrain.py 와 동일, engine_multimodal_pretrain_2 만 사용.
-# 출력은 기본값을 output_pretrain_zscore_2 / log_dir 도 동일.
+# main_multimodal_pretrain_ppi.py  ─ PPI 클러스터 RNA 사용 (rna_dim = n_clusters from pkl)
+# pre-training/main_multimodal_pretrain_2.py 복제, rna_dim은 pkl의 n_genes(n_clusters) 사용.
 import datetime
 import os
 import sys
 import json
+import pickle
 import time
 import random
 from pathlib import Path
@@ -14,8 +14,9 @@ import torch
 import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
 
-sys.path.append(os.path.dirname(os.path.dirname(os.getcwd())))
-sys.path.append(os.path.dirname(os.getcwd()))
+# ppi_rna 폴더 기준으로 import (실행 시 cwd가 ppi_rna 또는 프로젝트 루트일 수 있음)
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _SCRIPT_DIR)
 
 import utils.misc as misc
 from utils.misc import NativeScalerWithGradNormCount as NativeScaler
@@ -42,19 +43,19 @@ def set_seed(seed: int):
 
 def get_args():
     import argparse
-    ap = argparse.ArgumentParser("TCGA-LUAD Multimodal Pretraining (v2: POC unmasked, loss scale)")
+    ap = argparse.ArgumentParser("TCGA-LUAD Multimodal Pretraining (PPI cluster RNA)")
 
-    ap.add_argument("--data_pkl",    default="./datasets/rna_processed_zscore.pkl",
-                    help="z-score 전처리 pkl (log1p 사용 시 --data_pkl ./datasets/rna_processed.pkl)")
-    ap.add_argument("--n_genes",     default=2000, type=int)
+    ap.add_argument("--data_pkl", default="./datasets/rna_ppi_clusters.pkl",
+                    help="PPI 클러스터 전처리 결과 pkl (n_genes=n_clusters)")
+    ap.add_argument("--n_genes", default=None, type=int,
+                    help="미지정 시 pkl의 n_genes 사용 (n_clusters)")
     ap.add_argument("--max_patches", default=300,  type=int)
 
     ap.add_argument("--epochs",      default=501,  type=int)
     ap.add_argument("--batch_size",   default=1,    type=int)
     ap.add_argument("--accum_iter",   default=50,   type=int)
     ap.add_argument("--mask_ratio",   default=0.3,  type=float)
-    ap.add_argument("--mom_weight",   default=3.0,  type=float,
-                    help="MOM 항 가중치 (기본 3.0, 예전 v1과 동일). POC/POM이 묻히면 낮춤(1.0 등)")
+    ap.add_argument("--mom_weight",   default=0.3,  type=float)
     ap.add_argument("--num_workers",   default=8,    type=int)
 
     ap.add_argument("--lr",           default=5e-4, type=float)
@@ -68,12 +69,11 @@ def get_args():
     ap.add_argument("--drop_path",    default=0.1,  type=float)
     ap.add_argument("--global_pool",  action="store_true", default=True)
 
-    ap.add_argument("--output_dir",   default="./output_pretrain_zscore_2")
-    ap.add_argument("--log_dir",      default=None,
-                    help="TensorBoard 로그 경로 (미지정 시 output_dir과 동일)")
-    ap.add_argument("--exptype",      default="tcga_luad_v2")
+    ap.add_argument("--output_dir",   default="./output_pretrain_ppi")
+    ap.add_argument("--log_dir",      default="./output_pretrain_ppi")
+    ap.add_argument("--exptype",      default="tcga_luad_ppi")
     ap.add_argument("--save_every",   default=100,  type=int)
-    ap.add_argument("--start_epoch",   default=0,    type=int)
+    ap.add_argument("--start_epoch",  default=0,    type=int)
     ap.add_argument("--resume",       default="",   type=str)
 
     ap.add_argument("--device",       default="cuda")
@@ -82,7 +82,7 @@ def get_args():
     ap.add_argument("--dist_on_itp",   action="store_true", default=False)
     ap.add_argument("--distributed",   action="store_true", default=False)
     ap.add_argument("--world_size",   default=1,    type=int)
-    ap.add_argument("--local_rank",    default=-1,   type=int)
+    ap.add_argument("--local_rank",   default=-1,    type=int)
     ap.add_argument("--dist_url",     default="env://")
 
     return ap.parse_args()
@@ -93,7 +93,12 @@ def main(args):
     device = torch.device(args.device)
 
     set_seed(args.seed)
-    logger.info(f"seed: {args.seed} (pretrain v2: POC=unmasked RNA, MOM loss scaled)")
+
+    # PPI pkl에서 rna_dim(n_clusters) 읽기 (미지정 시)
+    with open(args.data_pkl, "rb") as f:
+        pkl_data = pickle.load(f)
+    rna_dim = args.n_genes if args.n_genes is not None else int(pkl_data["n_genes"])
+    logger.info(f"rna_dim (n_clusters) from pkl: {rna_dim}")
 
     dataset = build_dataset(args.data_pkl, max_num_region=args.max_patches)
     data_loader = torch.utils.data.DataLoader(
@@ -105,12 +110,11 @@ def main(args):
         drop_last   = False,
     )
 
-    log_dir = args.log_dir or args.output_dir
-    os.makedirs(log_dir, exist_ok=True)
-    log_writer = SummaryWriter(log_dir=log_dir) if misc.get_rank() == 0 else None
+    os.makedirs(args.log_dir, exist_ok=True)
+    log_writer = SummaryWriter(log_dir=args.log_dir) if misc.get_rank() == 0 else None
 
     model = vit_base_patch16(
-        rna_dim        = args.n_genes,
+        rna_dim        = rna_dim,
         drop_path_rate = args.drop_path,
         global_pool    = args.global_pool,
         num_classes    = 0,
@@ -129,7 +133,7 @@ def main(args):
     misc.load_model(args=args, model_without_ddp=model,
                     optimizer=optimizer, loss_scaler=loss_scaler)
 
-    logger.info(f"학습 시작: {args.epochs} epochs (engine_2)")
+    logger.info(f"학습 시작 (PPI cluster RNA): {args.epochs} epochs")
     start = time.time()
 
     for epoch in range(args.start_epoch, args.epochs):
@@ -154,16 +158,9 @@ def main(args):
         if args.output_dir and misc.is_main_process():
             if log_writer:
                 log_writer.flush()
-            # numpy 등 → float 변환해 JSON 직렬화 오류 방지
-            log_stats_ser = {k: float(v) if isinstance(v, (np.floating, np.integer)) else v for k, v in log_stats.items()}
-            # 에폭별 loss만 한 줄씩 (plot_pretrain_loss.py용, nohup 리다이렉트와 분리)
-            epochs_path = os.path.join(args.output_dir, f"log_pretrain_{args.exptype}_epochs.jsonl")
-            with open(epochs_path, "a") as f:
-                f.write(json.dumps(log_stats_ser) + "\n")
-            # 기존 로그 파일에도 동일 내용 추가 (호환용)
             log_path = os.path.join(args.output_dir, f"log_pretrain_{args.exptype}.txt")
             with open(log_path, "a") as f:
-                f.write(json.dumps(log_stats_ser) + "\n")
+                f.write(json.dumps(log_stats) + "\n")
 
     elapsed = str(datetime.timedelta(seconds=int(time.time() - start)))
     logger.info(f"학습 완료. 소요시간: {elapsed}")

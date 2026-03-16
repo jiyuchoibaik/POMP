@@ -1,6 +1,9 @@
 import os
+import sys
 # CUDA OOM 완화: 메모리 단편화 감소 (에러 메시지에 나오는 변수명이 정확함)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+print("[survival] imports starting...", flush=True)
+sys.stdout.flush()
 
 import datetime
 import numpy as np
@@ -107,11 +110,11 @@ def main(args):
             num_classes   = args.nb_classes,
             drop_path_rate= args.drop_path,
             global_pool   = args.global_pool,
-            n_genes       = args.n_genes,       # ← 추가
+            n_genes       = args.n_genes,
         )
         model.gradient_checkpointing = getattr(args, "gradient_checkpointing", True)
 
-        # ── Pre-trained 가중치 로드 ───────────────────────────────────────
+        # ── Pre-trained 가중치 로드 (pre-training/output_pretrain_zscore/checkpoint_*.pth 등) ──
         if args.finetune and not args.eval:
             checkpoint = torch.load(args.finetune, map_location='cpu', weights_only=False)
             logger.info(f"Pre-trained 체크포인트 로드: {args.finetune}")
@@ -119,16 +122,14 @@ def main(args):
             ckpt_model = checkpoint.get('model', checkpoint)
             state_dict = model.state_dict()
 
-            # 크기 불일치 키 제거 (linear: 300→n_genes 등)
-            skip_keys = []
+            # 크기 불일치 키 제거 (rna_dim 등 달라지면 해당 레이어만 스킵)
             for k in list(ckpt_model.keys()):
                 if k in state_dict and ckpt_model[k].shape != state_dict[k].shape:
                     logger.info(f"  shape 불일치 스킵: {k} "
                                 f"{ckpt_model[k].shape} → {state_dict[k].shape}")
-                    skip_keys.append(k)
                     del ckpt_model[k]
 
-            # pre-training에 없는 survival 전용 키 제거
+            # pre-training에는 없는 survival 전용 risk_head는 체크포인트에서 제거 (아래에서 초기화)
             for k in ['risk_head.0.weight', 'risk_head.0.bias']:
                 ckpt_model.pop(k, None)
 
@@ -225,10 +226,10 @@ def main(args):
                 list_for_reload_best = []
 
                 best_predict_split = [
-                    round(train_stats['c-index'], 4),
+                    round(train_stats.get('c-index', 0.0), 4),
                     round(val_stats['c-index'],   4),
                     round(test_stats['c-index'],  4),
-                    round(train_stats['p-value'], 10),
+                    round(train_stats.get('p-value', 1.0), 10),
                     round(val_stats['p-value'],   10),
                     round(test_stats['p-value'],  10),
                 ]
@@ -369,6 +370,12 @@ def get_args():
 
 
 if __name__ == '__main__':
+    print("[survival] script started", flush=True)
+    sys.stdout.flush()
+    sys.stderr.flush()
     args = get_args()
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    if args.log_dir:
+        Path(args.log_dir).mkdir(parents=True, exist_ok=True)
+    print(f"[survival] output_dir={args.output_dir}, log_dir={args.log_dir}", flush=True)
     main(args)

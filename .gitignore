@@ -5,11 +5,16 @@ pre-training/datasets/rna_processed.pkl
 pre-training/datasets/datasets_multimodal_pretrain.pkl
 survival/datasets/*.pkl
 survival/datasets/luad_cv_splits.pkl
+pre-training/datasets/rna_processed_zscore.pkl
 
 # ========== 학습/평가 출력 (체크포인트, 로그, TensorBoard) ==========
 pre-training/output_pretrain/
 pre-training/output_pretrain_2/
 pre-training/output_pretrain_3/
+pre-training/output_pretrain_zscore/
+pre-training/output_pretrain_zscore_2/
+
+
 
 
 output_finetune/

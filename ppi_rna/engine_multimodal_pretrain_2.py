@@ -1,7 +1,7 @@
 # engine_multimodal_pretrain_2.py  ─ POC는 마스킹 안 한 RNA, loss 스케일 맞춤
 # 기존 engine_multimodal_pretrain.py 와 동일한 구조 + 아래 변경만 적용.
 #  - POC: omics_cls를 마스킹 안 한 x_rna로 한 번 더 forward 해서 사용 (정렬 학습 강화).
-#  - MOM: loss_mom * mom_weight (예전 v1과 동일, 기본 3.0). 1/sqrt(n_genes) 스케일 제거해 MOM이 충분히 반영되도록 함.
+#  - MOM loss 스케일: 1/sqrt(n_genes) 로 보정해 gradient 균형 (POC/POM이 실제로 학습되도록).
 #  - [수정1] detach 제거 → 모든 샘플에서 gradient 흐름
 #  - [수정2] loss_scaler에 clip_grad 실제로 전달 (이전엔 누락되어 clip_grad가 적용 안 됨)
 import math
@@ -107,9 +107,6 @@ def train_one_epoch(model: torch.nn.Module,
             loss_poc = (F.cross_entropy(sim_i2o, labels_poc) +
                         F.cross_entropy(sim_o2i, labels_poc)) / 2
 
-            # logit_scale 상한 (CLIP 방식): exp(logit_scale) <= 100
-            model.logit_scale.data.clamp_(0, 4.6052)
-
             # POC 디버그 (epoch 0,1에서만)
             if epoch <= 1 and (data_iter_step + 1) % accum_iter == 0:
                 logger.info(
@@ -169,8 +166,9 @@ def train_one_epoch(model: torch.nn.Module,
             image_embeds, omics_embeds, rna_masks = [], [], []
 
             # ── Total Loss ────────────────────────────────────────────────
-            mom_weight  = getattr(args, "mom_weight", 3.0)
-            loss = loss_poc * 1.0 + loss_pom * 6.0 + loss_mom * mom_weight
+            mom_scale  = 1.0 / math.sqrt(n_genes)
+            mom_weight = getattr(args, "mom_weight", 0.3)
+            loss = loss_poc * 1.0 + loss_pom * 6.0 + (loss_mom * mom_scale) * mom_weight
 
             metric_logger.update(loss_poc=loss_poc.item())
             metric_logger.update(loss_pom=loss_pom.item())
@@ -193,7 +191,8 @@ def train_one_epoch(model: torch.nn.Module,
             logger.info(f"[{data_iter_step+1}] loss={loss_value:.4f}  "
                         f"poc={loss_poc.item():.4f}  "
                         f"pom={loss_pom.item():.4f}  "
-                        f"mom={loss_mom.item():.4f} (×{mom_weight})")
+                        f"mom={loss_mom.item():.4f}  "
+                        f"(mom_scale=1/sqrt(n_genes), mom_weight={mom_weight})")
 
             lr = optimizer.param_groups[0]["lr"]
             metric_logger.update(lr=lr)

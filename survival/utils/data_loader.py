@@ -26,6 +26,20 @@ def default_loader(path: str):
     return pil_loader(path)
 
 
+def _resolve_region_path(path: str, root: str) -> str:
+    """region_pixel_5x 경로가 ./pre-training/... 형태일 때 프로젝트 루트 기준으로 해석."""
+    if os.path.isabs(path) and os.path.exists(path):
+        return path
+    norm = os.path.normpath(path)
+    if os.path.exists(norm):
+        return norm
+    # pkl이 프로젝트 루트에서 빌드된 경우: pre-training/datasets/patches/... → root/pre-training/...
+    joined = os.path.normpath(os.path.join(root, path.lstrip("./")))
+    if os.path.exists(joined):
+        return joined
+    return path
+
+
 class POMPDataset(Dataset):
     """
     원본 대비 변경:
@@ -35,6 +49,12 @@ class POMPDataset(Dataset):
 
     def __init__(self, data, split, loader=default_loader, max_num_region=250):
         self.max_num_region = max_num_region
+        # 프로젝트 루트 (survival/utils/data_loader.py → survival → POMP)
+        _root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+        def resolve_paths(arr):
+            return np.array([_resolve_region_path(p, _root) for p in arr], dtype=object)
+
         if split == "all":
             self.X_rna  = np.concatenate([data[s]['x_rna']
                                            for s in ("train", "validation", "test")])
@@ -44,11 +64,12 @@ class POMPDataset(Dataset):
                                              for s in ("train", "validation", "test")])
             self.region_pixel_5x = np.concatenate([data[s]['region_pixel_5x']
                                                     for s in ("train", "validation", "test")])
+            self.region_pixel_5x = resolve_paths(self.region_pixel_5x)
         else:
             self.X_rna           = data[split]['x_rna']           # (N, n_genes)
             self.censored        = data[split]['censored']         # (N,)
             self.survival        = data[split]['survival']         # (N,)
-            self.region_pixel_5x = data[split]['region_pixel_5x'] # (N,) str paths
+            self.region_pixel_5x = resolve_paths(np.array(data[split]['region_pixel_5x'], dtype=object))
 
     def __getitem__(self, index):
         single_censored = torch.tensor(self.censored[index]).type(torch.LongTensor)

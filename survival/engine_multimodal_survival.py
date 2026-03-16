@@ -60,7 +60,7 @@ def train_one_epoch(model: torch.nn.Module,
         with torch.amp.autocast("cuda"):
             samples = [regions, X_rna]
             outputs1, image_embed, omics_embed = model(samples)
-            outputs1 = outputs1.unsqueeze(1)
+            # risk1, path_guided risk 모두 (B,1) 반환 → (B,1) 유지 (unsqueeze 시 (B,1,1) 되어 Cox mm 오류)
             outputs2 = model.path_guided_omics_encoder(image_embed, omics_embed)
             outputs  = outputs1 + outputs2
 
@@ -83,10 +83,13 @@ def train_one_epoch(model: torch.nn.Module,
             censored_accum = censored_accum[order]
             survival_accum = survival_accum[order]
 
+            # concordance_index / cox_log_rank는 (N,) 필요. PartialLogLikelihood는 (N,1) 허용
+            outputs_flat = outputs_accum.flatten()
+
             try:
-                c_index = calc_concordance_index(outputs_accum, censored_accum, survival_accum)
+                c_index = calc_concordance_index(outputs_flat, censored_accum, survival_accum)
                 loss    = PartialLogLikelihood(outputs_accum, censored_accum, survival_accum)
-                p_value = cox_log_rank(outputs_accum.flatten(0), censored_accum, survival_accum)
+                p_value = cox_log_rank(outputs_flat, censored_accum, survival_accum)
             except Exception as e:
                 logger.info(f"loss 계산 오류: {e}")
                 outputs_accum = censored_accum = survival_accum = None
@@ -157,8 +160,9 @@ def evaluate(data_loader, model, device):
         censored_all = torch.cat((censored_all, censored), 0)
         survival_all = torch.cat((survival_all, survival), 0)
 
-    c_index = calc_concordance_index(output_all, censored_all, survival_all)
-    p_value = cox_log_rank(output_all.flatten(0), censored_all, survival_all)
+    output_flat = output_all.flatten()
+    c_index = calc_concordance_index(output_flat, censored_all, survival_all)
+    p_value = cox_log_rank(output_flat, censored_all, survival_all)
 
     metric_logger.meters['c-index'].update(c_index, n=data_loader.batch_size)
     metric_logger.meters['p-value'].update(p_value, n=data_loader.batch_size)
