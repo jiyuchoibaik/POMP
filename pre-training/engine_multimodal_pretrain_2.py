@@ -170,11 +170,12 @@ def train_one_epoch(model: torch.nn.Module,
 
             # ── Total Loss ────────────────────────────────────────────────
             mom_weight  = getattr(args, "mom_weight", 3.0)
-            loss = loss_poc * 1.0 + loss_pom * 6.0 + loss_mom * mom_weight
+            loss = loss_poc * 1.0 + loss_pom * 6.0 + loss_mom * mom_weight 
 
             metric_logger.update(loss_poc=loss_poc.item())
             metric_logger.update(loss_pom=loss_pom.item())
-            metric_logger.update(loss_mom=loss_mom.item())
+            # epoch 요약에 가중치 반영된 MOM 기록 (mom_weight 바꾸면 로그에서 바로 확인 가능)
+            metric_logger.update(loss_mom=(loss_mom.item() * mom_weight))
 
             loss_value = loss.item()
             if not math.isfinite(loss_value):

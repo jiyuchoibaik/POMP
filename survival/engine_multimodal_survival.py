@@ -35,8 +35,6 @@ def train_one_epoch(model: torch.nn.Module,
     survival_accum = None
     k = -1
 
-    # ── 원본: (regions, X_mrna, X_mirna, X_meth, censored, survival)
-    # ── 수정: (regions, X_rna, censored, survival)
     data_loader_tqdm = tqdm(
         enumerate(data_loader),
         total=len(data_loader),
@@ -59,8 +57,10 @@ def train_one_epoch(model: torch.nn.Module,
 
         with torch.amp.autocast("cuda"):
             samples = [regions, X_rna]
+            # [수정1] outputs1 = img_risk (cosine_similarity 아님)
+            # [수정2] path_guided_omics_encoder에 residual 추가됨
+            # [수정3] 둘 다 Sigmoid 없는 raw linear output
             outputs1, image_embed, omics_embed = model(samples)
-            # risk1, path_guided risk 모두 (B,1) 반환 → (B,1) 유지 (unsqueeze 시 (B,1,1) 되어 Cox mm 오류)
             outputs2 = model.path_guided_omics_encoder(image_embed, omics_embed)
             outputs  = outputs1 + outputs2
 
@@ -77,13 +77,11 @@ def train_one_epoch(model: torch.nn.Module,
         if k == accum_iter - 1 or data_iter_step == len(data_loader) - 1:
             k = -1
 
-            # 생존시간 내림차순 정렬 (Cox loss 요구사항)
             order = torch.argsort(survival_accum, descending=True)
             outputs_accum  = outputs_accum[order]
             censored_accum = censored_accum[order]
             survival_accum = survival_accum[order]
 
-            # concordance_index / cox_log_rank는 (N,) 필요. PartialLogLikelihood는 (N,1) 허용
             outputs_flat = outputs_accum.flatten()
 
             try:

@@ -1,8 +1,9 @@
 # survival/model/models_pomp.py
 # ---------------------------------------------------------------------------
 # [pre-training과 체크포인트 호환] pre-training/model/models_pomp.py 와 백본 동일.
-# - rna_linear, pom_head, mom_head, logit_scale 등 파라미터 이름/구조 일치 → checkpoint-*-400.pth 로드 가능.
-# - survival 전용: risk_head 추가, forward/path_guided_omics_encoder 가 생존 예측 출력으로 사용.
+# - [수정1] forward: cosine_similarity 완전 제거 → img_risk 반환
+# - [수정2] path_guided_omics_encoder: residual connection 추가 (원본 논문 구조)
+# - [수정3] risk_head: Sigmoid 제거 → Cox loss는 순서만 보므로 범위 제한 불필요
 # ---------------------------------------------------------------------------
 from functools import partial
 import math
@@ -28,7 +29,7 @@ class CrossAttention(nn.Module):
     def forward(self, query, key, value):
         attn = torch.matmul(self.q(query), self.k(key).transpose(-1, -2)) * self.scale
         attn = torch.softmax(attn, dim=-1)
-        self.last_attn = attn.detach()  # 시각화용 (survival 스크립트)
+        self.last_attn = attn.detach()  # 시각화용
         return torch.matmul(attn, self.v(value))
 
 
@@ -48,13 +49,6 @@ class PositionalEncoding(nn.Module):
 
 
 class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
-    """
-    pre-training VisionTransformer와 동일 백본 + survival 전용 risk_head.
-    - 체크포인트: rna_linear, pom_head, mom_head, logit_scale 등 그대로 로드.
-    - forward: (risk점수, img_embed, omics_embed) 반환 → engine에서 Cox loss용.
-    - path_guided_omics_encoder: 동일 fusion 후 risk_head로 생존 risk 반환.
-    """
-
     def __init__(self, rna_dim: int = 2000, global_pool: bool = False, **kwargs):
         super().__init__(**kwargs)
 
@@ -102,8 +96,8 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         self.cross_attn = nn.ModuleList([CrossAttention(self.embed_dim)])
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
-        # [survival 전용] pre-training에는 없음. 파인튜닝 시 초기화 후 학습.
-        self.risk_head = nn.Sequential(nn.Linear(self.embed_dim, 1), nn.Sigmoid())
+        # [수정3] Sigmoid 제거 → raw linear output (Cox loss는 순서만 보므로 OK)
+        self.risk_head = nn.Sequential(nn.Linear(self.embed_dim, 1))
         self.gradient_checkpointing = False
 
     def forward_features(self, samples):
@@ -140,26 +134,44 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         for blk in self.omics_transf:
             omics_inp = checkpoint(blk, omics_inp, use_reentrant=False) if self.gradient_checkpointing else blk(omics_inp)
         omics_inp = self.norm_omics_transf(omics_inp)
-        omics_cls = omics_inp[:, 0:1, :]
 
-        return img_cls, omics_cls, img, omics_inp
+        # [수정1] cosine_similarity 제거 → img_cls 직접 반환
+        return img_cls, img, omics_inp
 
     def path_guided_omics_encoder(self, image_embed, omics_embed):
-        """pre-training과 동일 fusion 후, survival용 risk_head로 risk 반환 (engine에서 outputs2)."""
+        """
+        [수정2] residual connection 추가 (원본 논문 구조).
+        fuse_transf 통과 후 omics_embed와 residual 합산.
+        """
         fused = omics_embed
+
+        # cross-attention: RNA가 이미지 참고
         for blk in self.cross_attn:
             fused = blk(query=fused, key=image_embed, value=image_embed)
+
+        # fuse_transf
         for blk in self.fuse_transf:
             fused = blk(fused)
+
+        # [수정2] residual connection
+        fused = fused + omics_embed
+
         fused = self.norm_fuse_transf(fused)
-        risk = self.risk_head(fused[:, 0:1, :]).squeeze(-1)
+
+        # [수정3] Sigmoid 없이 raw linear
+        risk = self.risk_head(fused[:, 0, :])  # (B, 1)
         return risk
 
     def forward(self, x):
-        """예전과 동일: outputs1 = cosine(img_cls, omics_cls), outputs2 = path_guided risk_head."""
-        img_cls, omics_cls, img, omics_inp = self.forward_features(x)
-        out1 = torch.nn.functional.cosine_similarity(img_cls, omics_cls, dim=-1)
-        return out1, img, omics_inp
+        """
+        [수정1] cosine_similarity 완전 제거.
+        img_cls → risk_head → img_risk 반환
+        engine: outputs = img_risk + path_guided_risk
+        """
+        img_cls, img, omics_inp = self.forward_features(x)
+        # [수정3] Sigmoid 없이 raw linear
+        img_risk = self.risk_head(img_cls.squeeze(1))  # (B, 1)
+        return img_risk, img, omics_inp
 
     def get_image_cls_region_attention(self, regions):
         """pre-training과 동일 (시각화/비교 스크립트용)."""
@@ -193,7 +205,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         return cls_to_region.cpu().float().numpy()
 
     def get_patch_spatial_attention(self, patch_tensor):
-        """survival 시각화용: 패치 내 공간 attention (기존 스크립트 호환)."""
+        """survival 시각화용: 패치 내 공간 attention."""
         with torch.no_grad():
             reg_emb = self.patch_embed(patch_tensor)
             reg_emb = self.pos_drop(reg_emb)

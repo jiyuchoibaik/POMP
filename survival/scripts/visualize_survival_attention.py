@@ -24,7 +24,7 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from survival.utils.data_loader import POMPDataset
+from survival.utils.data_loader import POMPDataset, _resolve_region_path
 
 
 def _get_args():
@@ -49,11 +49,44 @@ def _get_args():
                    help="WSI 썸네일 긴 변 최대 픽셀 (오버레이용)")
     p.add_argument("--top_pct", type=float, default=20.0,
                    help="상위 N%% attention만 강조 (해석용). 0이면 전체 표시, 20이면 상위 20%%만 색상/오버레이 (기본 20)")
+    p.add_argument("--attention_vmin", type=float, default=None,
+                   help="WSI 오버레이 컬러바 최소값 (예: 0.0). 미지정 시 데이터 min 사용")
+    p.add_argument("--attention_vmax", type=float, default=None,
+                   help="WSI 오버레이 컬러바 최대값 (예: 0.04). 미지정 시 데이터 max 사용")
     return p.parse_args()
 
 
+def _remap_legacy_finetune_state(state: dict, n_genes: int, embed_dim: int = 384) -> dict:
+    """
+    output_finetune 등 예전 형식(linear, gap.*) 체크포인트를 현재 모델 키로 변환.
+    체크포인트 shape: linear (384, 2000)=RNA투영, gap.linear_out (1,384)=risk head.
+    - linear -> rna_linear
+    - gap.linear_out -> risk_head.0
+    - gap.linear_in (384,384) -> 매핑 없음, 제거
+    """
+    state = dict(state)
+    if "linear.weight" not in state:
+        return state
+
+    # linear (embed_dim, rna_dim) = RNA projector
+    state["rna_linear.weight"] = state.pop("linear.weight")
+    state["rna_linear.bias"] = state.pop("linear.bias")
+
+    # gap.linear_out (1, embed_dim) = risk head
+    if "gap.linear_out.weight" in state:
+        state["risk_head.0.weight"] = state.pop("gap.linear_out.weight")
+    if "gap.linear_out.bias" in state:
+        state["risk_head.0.bias"] = state.pop("gap.linear_out.bias")
+
+    # gap.linear_in 은 현재 모델에 없음 → 제거해 unexpected로만 남김
+    for k in list(state.keys()):
+        if k.startswith("gap.linear_in"):
+            state.pop(k, None)
+    return state
+
+
 def load_model(checkpoint_path: str, n_genes: int, device: torch.device):
-    """Survival ViT 모델 생성 후 체크포인트 로드."""
+    """Survival ViT 모델 생성 후 체크포인트 로드. 예전 finetune 형식(linear, gap) 자동 변환."""
     sys.path.insert(0, os.path.join(_REPO_ROOT, "survival"))
     from model import models_pomp
 
@@ -63,8 +96,14 @@ def load_model(checkpoint_path: str, n_genes: int, device: torch.device):
         global_pool=True,
         n_genes=n_genes,
     )
-    state = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    model.load_state_dict(state, strict=True)
+    raw = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    state = raw.get("state_dict", raw)
+    state = _remap_legacy_finetune_state(state, n_genes=n_genes, embed_dim=384)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing:
+        print(f"[load_model] Missing keys (random init): {missing}")
+    if unexpected:
+        print(f"[load_model] Unexpected keys (ignored): {unexpected}")
     model.to(device)
     model.eval()
     return model
@@ -237,6 +276,8 @@ def plot_wsi_attention_overlay(
     top_pct: float = 0.0,
     regions: np.ndarray | None = None,
     patch_spatial_attn: np.ndarray | None = None,
+    attention_vmin: float | None = None,
+    attention_vmax: float | None = None,
 ):
     """
     WSI 썸네일 위에 패치별 attention 색상 + 최고 점수 패치 초록 박스.
@@ -309,6 +350,8 @@ def plot_wsi_attention_overlay(
     # 최고 attention 패치 인덱스
     best_idx = int(np.argmax(attn))
     attn_min, attn_max = attn.min(), attn.max()
+    if attention_vmin is not None and attention_vmax is not None:
+        attn_min, attn_max = attention_vmin, attention_vmax
     if attn_max <= attn_min:
         attn_max = attn_min + 1e-9
     norm = Normalize(vmin=attn_min, vmax=attn_max)
@@ -451,10 +494,14 @@ def main():
     # WSI 원본 위 오버레이 (--wsi_dir 있고 coords.npz 있을 때)
     if getattr(args, "wsi_dir", "") and args.wsi_dir.strip():
         region_path = data[args.split]["region_pixel_5x"][args.sample_idx]
+        region_path = _resolve_region_path(region_path, _REPO_ROOT)
         case_dir = os.path.dirname(region_path)
         case_id = os.path.basename(case_dir)
         coords_npz = os.path.join(case_dir, "coords.npz")
-        wsi_path = os.path.join(args.wsi_dir.strip(), case_id)
+        wsi_dir_abs = args.wsi_dir.strip()
+        if not os.path.isabs(wsi_dir_abs):
+            wsi_dir_abs = os.path.normpath(os.path.join(_REPO_ROOT, wsi_dir_abs))
+        wsi_path = os.path.join(wsi_dir_abs, case_id)
         # WSI 원본만 저장 (어텐션 오버레이 없음)
         out_original = os.path.join(args.out, f"wsi_original_fold{args.fold}_sample{args.sample_idx}.png")
         save_wsi_original(wsi_path, out_original, thumb_size=getattr(args, "thumb_size", 1200))
@@ -474,7 +521,17 @@ def main():
             top_pct=top_pct,
             regions=regions_np,
             patch_spatial_attn=patch_spatial_attn,
+            attention_vmin=getattr(args, "attention_vmin", None),
+            attention_vmax=getattr(args, "attention_vmax", None),
         )
+        if not os.path.isfile(out_wsi):
+            print(
+                "[오버레이 미생성] attention_wsi_*.png이 저장되지 않았습니다. "
+                "아래 경로를 확인하세요."
+            )
+            print(f"  coords.npz: {coords_npz} (존재: {os.path.isfile(coords_npz)})")
+            print(f"  wsi_path:   {wsi_path} (파일/폴더 존재: {os.path.exists(wsi_path)})")
+            print("  필요: pip install openslide-python, coords.npz는 extract_patches.py 또는 --coords_only 로 생성")
 
 
 if __name__ == "__main__":
